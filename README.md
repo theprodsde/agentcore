@@ -1,14 +1,18 @@
-# Comet OPs Incident Commander
+# AgentCore Incident Commander
 
-**Comet OPs** is an automation platform built natively for real-time recovery. It leverages episodic memory, parallel tool execution, and deterministic failure resilience to triage service interruptions directly from Slack or a Dashboard.
+**AgentCore** is an automation platform built natively for real-time recovery. It leverages episodic memory, parallel tool execution, and deterministic failure resilience to triage service interruptions directly from Slack or a Dashboard.
 
 ## Architecture Highlights
-- **Task Resilience & Checkpointing**: Every workflow step is persisted dynamically. If a pod crashes midway, Comet OP’s orchestrator resumes exactly where it failed, without redundantly querying data.
+- **Task Resilience & Checkpointing**: Every workflow step is persisted dynamically. If a pod crashes midway, AgentCore's orchestrator resumes exactly where it failed, without redundantly querying data.
 - **Episodic Memory Retrieval**: Each successful incident automatically seeds the contextual memory log so the LLM planner doesn't repeat identical queries on similar recurring incidents.
 - **Dual Flow Output**: Designed to interoperate elegantly via both Slack (Incident Commands / Webhooks) and a rich Web Dashboard (Trace Views).
 - **Docker-Ready**: Works out of the box using Node environment. Easily mounts a full production build on ARM64 or AMD64.
 
 ## Getting Started
+
+### Local Setup with CometAPI (No Gemini Key Required)
+
+Because AgentCore supports standard OpenAI-compatible endpoints (such as `COMET_API_BASE_URL`), you do **not** need a Gemini API key or external cloud LLM to run the application locally or in a sandbox. It fully supports CometAPI for inference, making the backend completely self-contained.
 
 ### Quickstart with Docker Compose
 
@@ -17,7 +21,7 @@
    ```bash
    docker-compose up --build
    ```
-3. Comet Ops will now be accessible at `http://localhost:3000`.
+3. AgentCore will now be accessible at `http://localhost:3000`.
 
 ### Manual Local Setup (Node JS)
 
@@ -30,7 +34,8 @@
    Create a `.env` file based on `.env.example`:
    ```bash
    cp .env.example .env
-   # Ensure you set the relevant LLM/COMET keys and Slack Tokens
+   # Set OPENAI_API_KEY and COMET_API_BASE_URL. No need for GEMINI_API_KEY.
+   # Set up Slack Tokens if testing Slack integrations natively.
    ```
 
 3. **Start Dev Server**

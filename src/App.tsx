@@ -15,7 +15,7 @@ export default function App() {
         <aside className="w-64 border-r border-slate-200 bg-white flex flex-col items-start justify-start flex-shrink-0">
           <div className="h-16 w-full flex items-center px-6 border-b border-slate-100">
             <Activity className="h-6 w-6 text-indigo-600 mr-2" />
-            <h1 className="font-semibold text-lg tracking-tight">Comet Ops</h1>
+            <h1 className="font-semibold text-lg tracking-tight">AgentCore</h1>
           </div>
           
           <nav className="w-full p-4 flex flex-col gap-1 flex-1">

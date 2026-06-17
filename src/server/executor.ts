@@ -1,6 +1,9 @@
 import { inMemoryDB, Task, Checkpoint } from "./db";
 import { EventEmitter } from "events";
 import crypto from "crypto";
+import { logger } from "./logger";
+import { getMcpClient, executeMcpTool } from "./mcp";
+import OpenAI from "openai";
 
 export const taskEventEmitter = new EventEmitter();
 
@@ -19,6 +22,7 @@ async function executeStep(
 
   task.current_step = { step_number: stepNumber, step_name: stepName, step_status: "running" };
   taskEventEmitter.emit(`checkpoint-${taskId}`, { ...task.current_step, event: "started" });
+  logger.info({ taskId, stepNumber, stepName }, "Starting step");
 
   const startTime = Date.now();
   let outputData = null;
@@ -35,6 +39,7 @@ async function executeStep(
   } catch (error: any) {
     status = "failed";
     errorInfo = error.message;
+    logger.error({ taskId, stepNumber, err: error }, "Step failed");
   }
 
   const durationMs = Date.now() - startTime;
@@ -62,7 +67,8 @@ async function executeStep(
   if (status === "failed") {
     throw new Error(errorInfo || "Step failed");
   }
-
+  
+  logger.info({ taskId, stepNumber, durationMs }, "Step completed successfully");
   return outputData;
 }
 
@@ -91,9 +97,26 @@ export async function runTaskOrchestrator(taskId: string) {
     }
 
     // Step 2: Planning (ST-011)
-    let planContext = {};
+    let planContext: any = {};
     if (!completedStepNumbers.includes(2)) {
       planContext = await executeStep(taskId, 2, "planner", { memoryContext }, async () => {
+        if ((process.env.OPENAI_API_KEY || process.env.COMET_API_BASE_URL) && !task.inject_failure) {
+          const openai = new OpenAI({ 
+            apiKey: process.env.OPENAI_API_KEY || "dummy-key",
+            baseURL: process.env.COMET_API_BASE_URL
+          });
+          const response = await openai.chat.completions.create({
+             model: 'gpt-4o-mini',
+             messages: [{ role: 'user', content: `Plan response for goal: ${task.goal}\nContext: ${task.context}\nRespond in strict JSON with {"intent": "string", "tools_selected": ["string"], "reasoning_summary": "string"}` }],
+          });
+          const txt = response.choices[0]?.message?.content || "{}";
+          // Quick parse JSON from markdown
+          try {
+             return JSON.parse(txt.replace(/```json/g, "").replace(/```/g, "").trim());
+          } catch(e) {
+             logger.error("OpenAI JSON Parse failed, falling back to procedural plan");
+          }
+        }
         await sleep(1000);
         return {
           intent: task.task_type,
@@ -106,9 +129,23 @@ export async function runTaskOrchestrator(taskId: string) {
     }
 
     // Step 3: MCP Tool Execution (ST-012, ST-040, ST-041)
-    let executionOutput = {};
+    let executionOutput: any = {};
     if (!completedStepNumbers.includes(3)) {
       executionOutput = await executeStep(taskId, 3, "execution", { planContext }, async () => {
+        const mcpClient = await getMcpClient();
+        if (mcpClient && !task.inject_failure && planContext.tools_selected && Array.isArray(planContext.tools_selected)) {
+           const results: Record<string, any> = {};
+           for (const tool of planContext.tools_selected) {
+              try {
+                 results[`tool_${tool}`] = await executeMcpTool(tool, { query: task.goal });
+              } catch(e: any) {
+                 logger.error({ err: e, tool }, "Real MCP Tool Execution Failed");
+                 results[`tool_${tool}`] = { success: false, error: e.message };
+              }
+           }
+           return results;
+        }
+
         await sleep(1500);
         return {
           tool_search_logs: { success: true, duration: 42, result: "Discovered repeated deadlock error in module 'inventory-service': ER_LOCK_WAIT_TIMEOUT." },
@@ -120,9 +157,25 @@ export async function runTaskOrchestrator(taskId: string) {
     }
 
     // Step 4: Synthesizer (ST-011)
-    let synthOutput = {};
+    let synthOutput: any = {};
     if (!completedStepNumbers.includes(4)) {
       synthOutput = await executeStep(taskId, 4, "synthesizer", { executionOutput }, async () => {
+        if ((process.env.OPENAI_API_KEY || process.env.COMET_API_BASE_URL) && !task.inject_failure) {
+          const openai = new OpenAI({ 
+            apiKey: process.env.OPENAI_API_KEY || "dummy-key",
+            baseURL: process.env.COMET_API_BASE_URL
+          });
+          const response = await openai.chat.completions.create({
+             model: 'gpt-4o-mini',
+             messages: [{ role: 'user', content: `Synthesize this data into a final report in JSON {"summary", "probable_cause", "affected_systems", "next_actions", "ticket_id"}: ${JSON.stringify(executionOutput)}` }],
+          });
+          const txt = response.choices[0]?.message?.content || "{}";
+          try {
+             return JSON.parse(txt.replace(/```json/g, "").replace(/```/g, "").trim());
+          } catch(e) {
+             logger.error("OpenAI JSON Parse failed, falling back to procedural synth");
+          }
+        }
         await sleep(1200);
         return {
           summary: "Isolated the issue to a deadlock timeout in the inventory service.",

@@ -28,8 +28,9 @@ const config = parseConfig();
 const app = express();
 const PORT = 3000;
 
-// Body parsing
-app.use(express.json());
+  // Body parsing
+  app.use(express.json());
+  app.use(express.urlencoded({ extended: true }));
 
 // Lazy-initialize OpenAI Client with Comet API base URL
 let aiInstance: OpenAI | null = null;
@@ -47,20 +48,74 @@ function getOpenAIClient(): OpenAI | null {
   return aiInstance;
 }
 
+import { logger } from "./src/server/logger.js";
+import { getSlackClient, sendSlackResponse } from "./src/server/slack.js";
+
 // ST-061: Slack event ingestion webhook
-app.post("/api/slack/events", (req, res) => {
-  const { type, challenge, event } = req.body;
+app.post("/api/slack/events", async (req, res) => {
+  logger.info({ headers: req.headers, body: req.body }, "Received request on /api/slack/events");
+  
+  const body = req.body || {};
 
   // 1. Initial Challenge verification for Slack Event Subscriptions
-  if (type === "url_verification") {
-    return res.status(200).send({ challenge });
+  if (body.type === "url_verification") {
+    // Slack explicitly says: respond with HTTP 200 and the challenge string
+    // Sending it as plain text or JSON both work. We'll send plain text to be absolutely safe
+    // and avoid any JSON encoding issues.
+    return res.status(200).type("text/plain").send(body.challenge);
   }
 
+  const { event } = body;
+
   // 2. Further Event Handling (ST-061 / ST-062)
-  console.log("Slack event received:", JSON.stringify(req.body, null, 2));
+  logger.info({ event: req.body }, "Slack event received");
   
   // Acknowledge immediately to prevent Slack retry timeouts
-  return res.status(200).send();
+  res.status(200).send();
+
+  if (event && event.type === "message" && !event.bot_id && event.text) {
+    const text = event.text.trim();
+    if (text.startsWith("!incident ") || text.startsWith("<@")) {
+      const goal = text.replace("!incident ", "").replace(/<@[^>]+>/g, "").trim();
+      
+      const taskId = crypto.randomUUID();
+      const traceId = `tr-${Math.random().toString(36).substring(2, 11)}-${Date.now().toString().slice(-4)}`;
+      
+      const newTask: Task = {
+        task_id: taskId,
+        goal,
+        context: `Triggered from Slack Channel: ${event.channel}`,
+        task_type: "incident",
+        user_id: event.user,
+        status: "pending",
+        resume_count: 0,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        final_output: null,
+        error: null,
+        trace_id: traceId,
+        inject_failure: false,
+      };
+
+      inMemoryDB.tasks.set(taskId, newTask);
+
+      // Acknowledge in thread
+      await sendSlackResponse(event.channel, event.ts, [], `*Task Enqueued:* \`${traceId}\`\nWorking on: ${goal}...`);
+
+      try {
+        await runTaskOrchestrator(taskId);
+        
+        const finalTask = inMemoryDB.tasks.get(taskId);
+        if (finalTask?.status === "completed") {
+          await sendSlackResponse(event.channel, event.ts, [], `*Task Completed:* \`${traceId}\`\n\n${finalTask.final_output}`);
+        } else if (finalTask?.status === "failed") {
+          await sendSlackResponse(event.channel, event.ts, [], `*Task Failed:* \`${traceId}\`\nError: ${finalTask.error}`);
+        }
+      } catch (err) {
+        logger.error({ err }, "Task orchestrator failed from Slack event");
+      }
+    }
+  }
 });
 
 // OAuth Redirect for Slack
