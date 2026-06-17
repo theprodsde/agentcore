@@ -1,0 +1,10 @@
+version: "3.8"
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      # - OPENAI_API_KEY=YOUR_API_KEY_HERE
+      # - COMET_API_BASE_URL=https://api.cometapi.com/v1

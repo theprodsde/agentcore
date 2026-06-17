@@ -1,0 +1,6 @@
+{
+  "name": "Incident Commander Dashboard",
+  "description": "An interactive, high-fidelity simulator and SOLID code playground for the Slack Incident Commander + GPT-4o-Mini MemoryAgent system.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
