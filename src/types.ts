@@ -1,52 +1,42 @@
-export interface CodeSnippet {
-  path: string;
-  language: string;
-  title: string;
-  description: string;
-  recoveryFeatures: string[];
-  code: string;
+export interface Task {
+  task_id: string;
+  goal: string;
+  context: string;
+  task_type: string;
+  user_id: string;
+  status: "pending" | "running" | "failed" | "completed";
+  current_step?: {
+    step_number: number;
+    step_name: string;
+    step_status: string;
+  };
+  resume_count: number;
+  created_at: string;
+  updated_at: string;
+  final_output: string | null;
+  error: string | null;
+  trace_id: string;
 }
 
-export interface SimulatedIncident {
+export interface Checkpoint {
   id: string;
-  title: string;
-  description: string;
-  severity: "low" | "medium" | "high" | "critical";
-  status: "pending" | "running" | "paused" | "completed" | "failed";
-  channel: string;
-  logs: string[];
-  createdAt: string;
-  durationMs?: number;
-  traceId: string;
-  checkpoints: CheckpointRecord[];
-  memoryHits: EpisodicMemory[];
-  finalOutput?: string;
-  summary?: string;
+  task_id: string;
+  step_number: number;
+  step_name: string;
+  step_status: "pending" | "running" | "success" | "failed";
+  duration_ms: number;
+  input_data: any;
+  output_data: any;
+  error_info: string | null;
+  created_at: string;
 }
 
-export interface CheckpointRecord {
-  stepNumber: number;
-  stepName: string;
-  stepStatus: "pending" | "running" | "success" | "failed";
-  outputData?: string;
-  errorInfo?: string;
-  durationMs?: number;
-}
-
-export interface EpisodicMemory {
-  id: string;
-  userId: string;
-  taskId?: string;
+export interface Memory {
+  memory_id: string;
+  task_id: string;
   goal: string;
   outcome: string;
-  similarity?: number;
-  createdAt: string;
+  score: number;
+  created_at: string;
 }
 
-export interface MetricSummary {
-  totalIncidents: number;
-  averageResponseTimeSec: number;
-  successRate: number;
-  activeIncidents: number;
-  memoryRecallHits: number;
-}

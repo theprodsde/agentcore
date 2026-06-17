@@ -153,7 +153,11 @@ export async function runTaskOrchestrator(taskId: string) {
 
     taskEventEmitter.emit(`task-update-${taskId}`, { status: task.status, final_output: task.final_output });
   } catch (error: any) {
-    console.error(`Task ${taskId} failed at step ${task.current_step?.step_number}: ${error.message}`);
+    if (task.inject_failure && task.resume_count === 0) {
+      console.log(`Task ${taskId} intentionally failed at step ${task.current_step?.step_number} for demo purposes: ${error.message}`);
+    } else {
+      console.error(`Task ${taskId} failed at step ${task.current_step?.step_number}: ${error.message}`);
+    }
     task.status = "failed";
     task.error = error.message;
     task.updated_at = new Date().toISOString();

@@ -408,6 +408,10 @@ app.get("/api/tasks/:task_id/memory", (req, res) => {
   });
 });
 
+app.get("/api/memory", (req, res) => {
+  return res.json({ items: inMemoryDB.memories });
+});
+
 
 // Serve frontend assets
 async function setupViteServerOrStatic() {

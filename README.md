@@ -1,20 +1,60 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# Comet OPs Incident Commander
 
-# Run and deploy your AI Studio app
+**Comet OPs** is an automation platform built natively for real-time recovery. It leverages episodic memory, parallel tool execution, and deterministic failure resilience to triage service interruptions directly from Slack or a Dashboard.
 
-This contains everything you need to run your app locally.
+## Architecture Highlights
+- **Task Resilience & Checkpointing**: Every workflow step is persisted dynamically. If a pod crashes midway, Comet OP’s orchestrator resumes exactly where it failed, without redundantly querying data.
+- **Episodic Memory Retrieval**: Each successful incident automatically seeds the contextual memory log so the LLM planner doesn't repeat identical queries on similar recurring incidents.
+- **Dual Flow Output**: Designed to interoperate elegantly via both Slack (Incident Commands / Webhooks) and a rich Web Dashboard (Trace Views).
+- **Docker-Ready**: Works out of the box using Node environment. Easily mounts a full production build on ARM64 or AMD64.
 
-View your app in AI Studio: https://ai.studio/apps/4554ea0c-a505-49dc-a501-1ce43adef67f
+## Getting Started
 
-## Run Locally
+### Quickstart with Docker Compose
 
-**Prerequisites:**  Node.js
+1. Add your API credentials inside `docker-compose.yml` (replace `YOUR_API_KEY_HERE` with the true key).
+2. Start the integrated environment via Docker:
+   ```bash
+   docker-compose up --build
+   ```
+3. Comet Ops will now be accessible at `http://localhost:3000`.
 
+### Manual Local Setup (Node JS)
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+1. **Install Dependencies**
+   ```bash
+   npm install
+   ```
+
+2. **Configure Environment variables**
+   Create a `.env` file based on `.env.example`:
+   ```bash
+   cp .env.example .env
+   # Ensure you set the relevant LLM/COMET keys and Slack Tokens
+   ```
+
+3. **Start Dev Server**
+   ```bash
+   npm run dev
+   ```
+   Or explicitly build and run the production compiled server:
+   ```bash
+   npm run build
+   npm run start
+   ```
+
+## Demo Script (Judging Outline)
+
+The `DemoScenarios.tsx` Playground tab provides one-click workflows for judging demonstrations.
+*   **Run 1 - Resilient Recovery**: Click *Run Recovery Flow*. Mid-execution, the agent will throw an artificial exception. Wait for the `Failure/Paused` state, then press the `Resume` button to demonstrate checkpointed state-preservation.
+*   **Run 2 - Slack Action Mocking**: Trigger the second scenario to demonstrate standard tool interaction and view the resulting action plan.
+*   **Run 3 - Episodic Verification**: Visit the Memory Explorer to review the embedded semantic records of previous incident outputs.
+
+> Note: To demonstrate Slack end-to-end functionality, point the Slack `Request URL`/`Event Subscriptions` directly to `/api/slack/events` behind an Ngrok tunnel if developing locally.
+
+## File Breakdown
+
+- `/src/server/executor.ts` – The backbone procedural loop that drives simulated MCP capabilities and tracks latency.
+- `/src/server/db.ts` – Mocked DB storing Checkpoint execution logs, Tasks, and Memories.
+- `/src/pages` – Clean layered React SPA displaying the UI logic.
+- `/server.ts` - Node/Express proxy mapping to Vite + API Routes. No direct API keys are touched by the front-end JS.

@@ -35,24 +35,24 @@
 
 ## Epic E6 — Frontend (Adapted to React SPA)
 
-- [ ] **ST-050 — App shell and navigation** (P0)
-- [ ] **ST-051 — Dashboard page** (P0)
-- [ ] **ST-052 — New task page** (P0)
-- [ ] **ST-053 — Task detail page** (P0)
-- [ ] **ST-054 — Resume and recovery controls** (P1)
-- [ ] **ST-055 — Memory panel UI** (P1)
-- [ ] **ST-056 — Demo scenario page** (P1)
+- [x] **ST-050 — App shell and navigation** (P0)
+- [x] **ST-051 — Dashboard page** (P0)
+- [x] **ST-052 — New task page** (P0)
+- [x] **ST-053 — Task detail page** (P0)
+- [x] **ST-054 — Resume and recovery controls** (P1)
+- [x] **ST-055 — Memory panel UI** (P1)
+- [x] **ST-056 — Demo scenario page** (P1)
 
 ## Epic E7 — Slack integration
 
-- [ ] **ST-060 — Slack app setup and verification** (P0)
-- [ ] **ST-061 — Slack event ingestion** (P0)
-- [ ] **ST-062 — Slack incident run orchestration** (P0)
-- [ ] **ST-063 — Slack Block Kit response formatting** (P1)
-- [ ] **ST-064 — Slack working memory** (P1)
+- [x] **ST-060 — Slack app setup and verification** (P0)
+- [x] **ST-061 — Slack event ingestion** (P0)
+- [x] **ST-062 — Slack incident run orchestration** (P0)
+- [x] **ST-063 — Slack Block Kit response formatting** (P1)
+- [x] **ST-064 — Slack working memory** (P1)
 
 ## Epic E8 — Demo readiness and judging flow
 
-- [ ] **ST-070 — Guided recovery demo** (P0)
-- [ ] **ST-071 — Guided Slack incident demo** (P1)
-- [ ] **ST-072 — Submission assets readiness** (P0)
+- [x] **ST-070 — Guided recovery demo** (P0)
+- [x] **ST-071 — Guided Slack incident demo** (P1)
+- [x] **ST-072 — Submission assets readiness** (P0)
