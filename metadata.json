@@ -1,6 +1,5 @@
 {
-  "name": "Incident Commander Dashboard",
-  "description": "An interactive, high-fidelity simulator and SOLID code playground for the Slack Incident Commander + GPT-4o-Mini MemoryAgent system.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "name": "AgentCore",
+  "description": "AI-powered incident response orchestrator with checkpointing, episodic memory, MCP tool execution, and Slack integration.",
+  "version": "0.1.0"
 }

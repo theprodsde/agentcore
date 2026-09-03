@@ -1,12 +1,16 @@
-import pino from 'pino';
+import pino from "pino";
+import { activeTraceContext } from "./telemetry.js";
 
 export const logger = pino({
-  level: process.env.LOG_LEVEL || 'warn',
+  level: process.env.LOG_LEVEL || "warn",
+  mixin() {
+    return activeTraceContext();
+  },
   transport: {
-    target: 'pino-pretty',
+    target: "pino-pretty",
     options: {
       colorize: true,
-      translateTime: 'SYS:standard',
+      translateTime: "SYS:standard",
     },
   },
 });

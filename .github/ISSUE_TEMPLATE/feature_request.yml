@@ -1,0 +1,61 @@
+name: Feature Request
+description: Suggest a new tool, integration, or capability
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests are welcome. Describing the problem you're trying to solve helps more than describing the solution you have in mind.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the situation where you need this. Be specific about your team size, stack, and incident type.
+      placeholder: "During on-call, I have to manually check X every time Y happens. It takes Z minutes and..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What would you build or change?
+      placeholder: "A new MCP tool `restart_pod` that takes a service name and calls the Kubernetes API..."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area does this touch?
+      options:
+        - New MCP tool
+        - New LLM / model backend
+        - New log / metrics / ticket backend
+        - Orchestrator pipeline (new step or step behaviour)
+        - Memory / retrieval
+        - Auth / multi-tenancy
+        - Slack integration
+        - Dashboard / UI
+        - Observability / tracing
+        - Developer experience (DX)
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      placeholder: "I tried using X but it doesn't work because..."
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this hasn't been requested before
+          required: true
+        - label: This is scoped to AgentCore — not a request to add unrelated tooling
+          required: true

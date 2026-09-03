@@ -17,7 +17,7 @@ Because `executor.ts` reads/writes purely to the Checkpoint and Task interfaces,
 Inside `executeStep`, replace the mock response with an actual prompt chain. The orchestrator feeds the previous checkpoint string directly:
 ```typescript
 const response = await ai.generateContent({
-  model: 'gemini-3.1-pro',
+  model: 'gemini-2.0-flash',
   contents: `You are an Incident Planner. Based on this memory ${memoryContext}, create a plan.`
 });
 return JSON.parse(response.text);

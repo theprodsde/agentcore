@@ -1,219 +1,413 @@
-import { inMemoryDB, Task, Checkpoint } from "./db";
 import { EventEmitter } from "events";
 import crypto from "crypto";
+import { eq, and, inArray, sql } from "drizzle-orm";
+import { db, tasks, checkpoints, memories } from "./db/index";
 import { logger } from "./logger";
-import { getMcpClient, executeMcpTool } from "./mcp";
-import OpenAI from "openai";
+import { getMcpClient, executeMcpTool, listMcpTools } from "./mcp";
+import { embed } from "./embeddings";
+import { getLLMClient, LLM_MODELS } from "./llm";
+import { tracer, SpanStatusCode } from "./telemetry";
+import { parseLLMJson, toErrorMessage } from "../utils/index";
 
 export const taskEventEmitter = new EventEmitter();
 
-// Simulate an LLM call or MCP Tool execution
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface PlanContext {
+  intent?: string;
+  tool_calls?: ToolCall[];
+  reasoning_summary?: string;
+  [key: string]: unknown;
+}
+
+interface ToolCall {
+  tool: string;
+  args: Record<string, unknown>;
+}
+
+interface McpContentResult {
+  content?: { type: string; text: string }[];
+}
+
+interface SynthOutput {
+  summary: string;
+  probable_cause: string;
+  affected_systems: string[];
+  next_actions: string[];
+  ticket_id: string;
+}
+
+// ─── Shared checkpoint wrapper ────────────────────────────────────────────────
 
 async function executeStep(
   taskId: string,
   stepNumber: number,
   stepName: string,
-  inputData: any,
-  runLogic: () => Promise<any>
-) {
-  const task = inMemoryDB.tasks.get(taskId);
+  inputData: unknown,
+  runLogic: () => Promise<unknown>
+): Promise<unknown> {
+  const [task] = await db.select().from(tasks).where(eq(tasks.task_id, taskId));
   if (!task) return null;
 
-  task.current_step = { step_number: stepNumber, step_name: stepName, step_status: "running" };
-  taskEventEmitter.emit(`checkpoint-${taskId}`, { ...task.current_step, event: "started" });
-  logger.info({ taskId, stepNumber, stepName }, "Starting step");
-
-  const startTime = Date.now();
-  let outputData = null;
-  let errorInfo = null;
-  let status: "success" | "failed" = "success";
-
-  try {
-    // Artificial failure injection mechanism for Demo Case 1 (ST-070)
-    if (task.inject_failure && stepNumber === 3 && stepName === "execution" && task.resume_count === 0) {
-      throw new Error("Simulated network timeout during tool execution. Pod lost connection to database.");
-    }
-
-    outputData = await runLogic();
-  } catch (error: any) {
-    status = "failed";
-    errorInfo = error.message;
-    logger.error({ taskId, stepNumber, err: error }, "Step failed");
-  }
-
-  const durationMs = Date.now() - startTime;
-
-  const checkpoint: Checkpoint = {
-    id: crypto.randomUUID(),
-    task_id: taskId,
-    step_number: stepNumber,
-    step_name: stepName,
-    step_status: status,
-    duration_ms: durationMs,
-    input_data: inputData,
-    output_data: outputData,
-    error_info: errorInfo,
-    created_at: new Date().toISOString(),
-  };
-
-  const checkpoints = inMemoryDB.checkpoints.get(taskId) || [];
-  checkpoints.push(checkpoint);
-  inMemoryDB.checkpoints.set(taskId, checkpoints);
-
-  task.current_step = { step_number: stepNumber, step_name: stepName, step_status: status };
-  taskEventEmitter.emit(`checkpoint-${taskId}`, { ...checkpoint, event: status });
-
-  if (status === "failed") {
-    throw new Error(errorInfo || "Step failed");
-  }
-  
-  logger.info({ taskId, stepNumber, durationMs }, "Step completed successfully");
-  return outputData;
-}
-
-export async function runTaskOrchestrator(taskId: string) {
-  const task = inMemoryDB.tasks.get(taskId);
-  if (!task) return;
-
-  try {
-    task.status = "running";
-    task.updated_at = new Date().toISOString();
-    taskEventEmitter.emit(`task-update-${taskId}`, { status: task.status });
-
-    const checkpoints = inMemoryDB.checkpoints.get(taskId) || [];
-    const completedStepNumbers = checkpoints.filter((c) => c.step_status === "success").map((c) => c.step_number);
-
-    // Step 1: Memory Retrieval (ST-032)
-    let memoryContext = {};
-    if (!completedStepNumbers.includes(1)) {
-      memoryContext = await executeStep(taskId, 1, "memory_retrieval", { goal: task.goal }, async () => {
-        await sleep(600);
-        const related = inMemoryDB.memories.slice(0, 2);
-        return { loaded_memories: related.length, context: "Enhanced context loaded from episodic memory." };
-      });
-    } else {
-      memoryContext = checkpoints.find((c) => c.step_number === 1)?.output_data || {};
-    }
-
-    // Step 2: Planning (ST-011)
-    let planContext: any = {};
-    if (!completedStepNumbers.includes(2)) {
-      planContext = await executeStep(taskId, 2, "planner", { memoryContext }, async () => {
-        if ((process.env.OPENAI_API_KEY || process.env.COMET_API_BASE_URL) && !task.inject_failure) {
-          const openai = new OpenAI({ 
-            apiKey: process.env.OPENAI_API_KEY || "dummy-key",
-            baseURL: process.env.COMET_API_BASE_URL
-          });
-          const response = await openai.chat.completions.create({
-             model: 'gpt-4o-mini',
-             messages: [{ role: 'user', content: `Plan response for goal: ${task.goal}\nContext: ${task.context}\nRespond in strict JSON with {"intent": "string", "tools_selected": ["string"], "reasoning_summary": "string"}` }],
-          });
-          const txt = response.choices[0]?.message?.content || "{}";
-          // Quick parse JSON from markdown
-          try {
-             return JSON.parse(txt.replace(/```json/g, "").replace(/```/g, "").trim());
-          } catch(e) {
-             logger.error("OpenAI JSON Parse failed, falling back to procedural plan");
-          }
-        }
-        await sleep(1000);
-        return {
-          intent: task.task_type,
-          tools_selected: ["search_logs", "get_metrics"],
-          reasoning_summary: "Based on the goal, examining recent system logs and metric telemetry will isolate the bottleneck.",
-        };
-      });
-    } else {
-      planContext = checkpoints.find((c) => c.step_number === 2)?.output_data || {};
-    }
-
-    // Step 3: MCP Tool Execution (ST-012, ST-040, ST-041)
-    let executionOutput: any = {};
-    if (!completedStepNumbers.includes(3)) {
-      executionOutput = await executeStep(taskId, 3, "execution", { planContext }, async () => {
-        const mcpClient = await getMcpClient();
-        if (mcpClient && !task.inject_failure && planContext.tools_selected && Array.isArray(planContext.tools_selected)) {
-           const results: Record<string, any> = {};
-           for (const tool of planContext.tools_selected) {
-              try {
-                 results[`tool_${tool}`] = await executeMcpTool(tool, { query: task.goal });
-              } catch(e: any) {
-                 logger.error({ err: e, tool }, "Real MCP Tool Execution Failed");
-                 results[`tool_${tool}`] = { success: false, error: e.message };
-              }
-           }
-           return results;
-        }
-
-        await sleep(1500);
-        return {
-          tool_search_logs: { success: true, duration: 42, result: "Discovered repeated deadlock error in module 'inventory-service': ER_LOCK_WAIT_TIMEOUT." },
-          tool_get_metrics: { success: true, duration: 25, result: "CPU spike corresponding to deadlock timestamps." },
-        };
-      });
-    } else {
-      executionOutput = checkpoints.find((c) => c.step_number === 3)?.output_data || {};
-    }
-
-    // Step 4: Synthesizer (ST-011)
-    let synthOutput: any = {};
-    if (!completedStepNumbers.includes(4)) {
-      synthOutput = await executeStep(taskId, 4, "synthesizer", { executionOutput }, async () => {
-        if ((process.env.OPENAI_API_KEY || process.env.COMET_API_BASE_URL) && !task.inject_failure) {
-          const openai = new OpenAI({ 
-            apiKey: process.env.OPENAI_API_KEY || "dummy-key",
-            baseURL: process.env.COMET_API_BASE_URL
-          });
-          const response = await openai.chat.completions.create({
-             model: 'gpt-4o-mini',
-             messages: [{ role: 'user', content: `Synthesize this data into a final report in JSON {"summary", "probable_cause", "affected_systems", "next_actions", "ticket_id"}: ${JSON.stringify(executionOutput)}` }],
-          });
-          const txt = response.choices[0]?.message?.content || "{}";
-          try {
-             return JSON.parse(txt.replace(/```json/g, "").replace(/```/g, "").trim());
-          } catch(e) {
-             logger.error("OpenAI JSON Parse failed, falling back to procedural synth");
-          }
-        }
-        await sleep(1200);
-        return {
-          summary: "Isolated the issue to a deadlock timeout in the inventory service.",
-          probable_cause: "High contention on row locks for popular items during the spike.",
-          affected_systems: ["inventory-service", "postgres-primary"],
-          next_actions: ["Restart affected pods to flush connection blocks", "Increase max pooled connections"],
-          ticket_id: "INC-9952",
-        };
-      });
-    } else {
-      synthOutput = checkpoints.find((c) => c.step_number === 4)?.output_data || {};
-    }
-
-    // Task Complete Updates (ST-030)
-    task.status = "completed";
-    task.final_output = JSON.stringify(synthOutput, null, 2);
-    task.updated_at = new Date().toISOString();
-
-    // Write to memory
-    inMemoryDB.memories.push({
-      memory_id: crypto.randomUUID(),
-      task_id: taskId,
-      goal: task.goal,
-      outcome: `Successfully mapped ${task.task_type} intent. Resolved via: High contention row locks.`,
-      score: 0.95,
-      created_at: new Date().toISOString()
+  return tracer.startActiveSpan(`step.${stepName}`, async (span) => {
+    span.setAttributes({
+      "task.id": taskId,
+      "task.trace_id": task.trace_id,
+      "step.number": stepNumber,
+      "step.name": stepName,
     });
 
-    taskEventEmitter.emit(`task-update-${taskId}`, { status: task.status, final_output: task.final_output });
-  } catch (error: any) {
-    if (task.inject_failure && task.resume_count === 0) {
-      console.log(`Task ${taskId} intentionally failed at step ${task.current_step?.step_number} for demo purposes: ${error.message}`);
-    } else {
-      console.error(`Task ${taskId} failed at step ${task.current_step?.step_number}: ${error.message}`);
+    await db.update(tasks)
+      .set({ current_step: { step_number: stepNumber, step_name: stepName, step_status: "running" }, updated_at: new Date() })
+      .where(eq(tasks.task_id, taskId));
+
+    taskEventEmitter.emit(`checkpoint-${taskId}`, { step_number: stepNumber, step_name: stepName, step_status: "running", event: "started" });
+    logger.info({ taskId, stepNumber, stepName }, "Starting step");
+
+    const startTime = Date.now();
+    let outputData: unknown = null;
+    let errorInfo: string | null = null;
+    let status: "success" | "failed" = "success";
+
+    try {
+      if (task.inject_failure && stepNumber === 3 && stepName === "execution" && task.resume_count === 0) {
+        throw new Error("Simulated network timeout during tool execution. Pod lost connection to database.");
+      }
+      outputData = await runLogic();
+    } catch (error: unknown) {
+      status = "failed";
+      errorInfo = toErrorMessage(error);
+      span.recordException(error instanceof Error ? error : new Error(errorInfo));
+      span.setStatus({ code: SpanStatusCode.ERROR, message: errorInfo });
+      logger.error({ taskId, stepNumber, err: error }, "Step failed");
     }
-    task.status = "failed";
-    task.error = error.message;
-    task.updated_at = new Date().toISOString();
-    taskEventEmitter.emit(`task-update-${taskId}`, { status: task.status, error: task.error });
+
+    const durationMs = Date.now() - startTime;
+    span.setAttributes({ "step.duration_ms": durationMs, "step.status": status });
+
+    const [checkpoint] = await db.insert(checkpoints).values({
+      id: crypto.randomUUID(),
+      task_id: taskId,
+      step_number: stepNumber,
+      step_name: stepName,
+      step_status: status,
+      duration_ms: durationMs,
+      input_data: inputData as Record<string, unknown>,
+      output_data: outputData as Record<string, unknown>,
+      error_info: errorInfo,
+    }).returning();
+
+    await db.update(tasks)
+      .set({ current_step: { step_number: stepNumber, step_name: stepName, step_status: status }, updated_at: new Date() })
+      .where(eq(tasks.task_id, taskId));
+
+    taskEventEmitter.emit(`checkpoint-${taskId}`, { ...checkpoint, event: status });
+
+    if (status !== "failed") {
+      span.setStatus({ code: SpanStatusCode.OK });
+      logger.info({ taskId, stepNumber, durationMs }, "Step completed successfully");
+    }
+    span.end();
+
+    if (status === "failed") throw new Error(errorInfo || "Step failed");
+    return outputData;
+  });
+}
+
+// ─── Step handlers (each independently testable) ─────────────────────────────
+
+export async function memoryRetrievalHandler(goal: string): Promise<Record<string, unknown>> {
+  const queryEmbedding = await embed(goal);
+  let related: typeof memories.$inferSelect[] = [];
+
+  if (queryEmbedding) {
+    related = await db.select().from(memories)
+      .where(sql`${memories.embedding} IS NOT NULL`)
+      .orderBy(sql`${memories.embedding} <=> ${JSON.stringify(queryEmbedding)}::vector`)
+      .limit(3);
+  } else {
+    related = await db.select().from(memories).limit(3);
+  }
+
+  return {
+    loaded_memories: related.length,
+    context: related.length > 0 ? "Relevant past incidents loaded from episodic memory." : "No prior incidents found.",
+    similar_incidents: related.map((m) => ({ goal: m.goal, outcome: m.outcome, score: m.score })),
+  };
+}
+
+export async function plannerHandler(
+  goal: string,
+  context: string,
+  taskType: string,
+  injectFailure: boolean
+): Promise<PlanContext> {
+  const llm = getLLMClient();
+
+  if (llm && !injectFailure) {
+    const toolList = await listMcpTools().catch(() => []);
+    const toolSummary = toolList.length > 0
+      ? toolList.map((t) => {
+          const schema = t.inputSchema as { properties?: Record<string, { type: string }> } | undefined;
+          const params = Object.entries(schema?.properties ?? {}).map(([k, v]) => `${k}(${v.type})`).join(", ");
+          return `- ${t.name}(${params}): ${t.description}`;
+        }).join("\n")
+      : "search_logs(service, query), get_metrics(service, metric), create_ticket(title, description, severity), list_services()";
+
+    const response = await llm.chat.completions.create({
+      model: LLM_MODELS.PLANNER,
+      messages: [{
+        role: "user",
+        content: `Plan a response for this incident goal: ${goal}\nContext: ${context}\n\nAvailable tools:\n${toolSummary}\n\nRespond in strict JSON:\n{"intent":"string","tool_calls":[{"tool":"string","args":{}}],"reasoning_summary":"string"}`,
+      }],
+    });
+
+    const parsed = parseLLMJson<PlanContext>(response.choices[0]?.message?.content ?? "{}");
+    if (parsed) return parsed;
+    logger.error("LLM JSON parse failed, falling back to procedural plan");
+  }
+
+  await sleep(1000);
+  const service = goal.split(" ").find((w) => w.includes("-service")) ?? "unknown-service";
+  return {
+    intent: taskType,
+    tool_calls: [
+      { tool: "search_logs", args: { service, query: goal, severity: "error" } },
+      { tool: "get_metrics",  args: { service, metric: "latency_p99", time_range: "1h" } },
+    ],
+    reasoning_summary: "Examining recent logs and metrics to isolate the issue.",
+  };
+}
+
+export async function executionHandler(
+  planContext: PlanContext,
+  goal: string,
+  injectFailure: boolean
+): Promise<Record<string, unknown>> {
+  const mcpClient = await getMcpClient();
+  const toolCalls = planContext.tool_calls;
+
+  if (mcpClient && !injectFailure && Array.isArray(toolCalls) && toolCalls.length > 0) {
+    const results: Record<string, unknown> = {};
+    for (const { tool, args } of toolCalls) {
+      try {
+        results[`tool_${tool}`] = await executeMcpTool(tool, args);
+      } catch (e: unknown) {
+        logger.error({ err: e, tool }, "MCP tool execution failed");
+        results[`tool_${tool}`] = { success: false, error: toErrorMessage(e) };
+      }
+    }
+    return results;
+  }
+
+  // Fallback: generate realistic stub results keyed to the actual tools the planner selected
+  await sleep(1500);
+  const service = planContext.tool_calls?.[0]?.args?.service as string ?? "unknown-service";
+  const results: Record<string, unknown> = {};
+
+  for (const call of planContext.tool_calls ?? []) {
+    results[`tool_${call.tool}`] = buildFallbackToolResult(call.tool, call.args, service);
+  }
+
+  return Object.keys(results).length > 0 ? results : {
+    tool_search_logs: buildFallbackToolResult("search_logs", { service, query: goal }, service),
+    tool_get_metrics:  buildFallbackToolResult("get_metrics",  { service, metric: "latency_p99" }, service),
+  };
+}
+
+/** Builds a plausible stub result for a given tool and its args — used when MCP is unavailable. */
+function buildFallbackToolResult(tool: string, args: Record<string, unknown>, service: string): unknown {
+  const now = new Date().toISOString();
+  switch (tool) {
+    case "search_logs":
+      return { backend: "fallback", service, query: args.query, total_matched: 2, entries: [
+        { timestamp: now, severity: "error", service, message: `Repeated failures detected in ${service}`, trace_id: `tr-${crypto.randomBytes(4).toString("hex")}` },
+        { timestamp: now, severity: "warn",  service, message: `High latency observed in ${service} request path`, trace_id: `tr-${crypto.randomBytes(4).toString("hex")}` },
+      ]};
+    case "get_metrics":
+      return { backend: "fallback", service, metric: args.metric, current: 87.4, unit: "%", trend: "rising", threshold: 80, threshold_breached: true };
+    case "create_ticket":
+      return { backend: "fallback", ticket_id: `INC-${Math.floor(1000 + Math.random() * 9000)}`, title: args.title, status: "open", created_at: now };
+    case "list_services":
+      return { backend: "fallback", services: [{ name: service, status: "degraded" }] };
+    default:
+      return { backend: "fallback", result: `Tool ${tool} executed` };
+  }
+}
+
+export async function synthesizerHandler(
+  executionOutput: Record<string, unknown>,
+  goal: string,
+  injectFailure: boolean
+): Promise<SynthOutput> {
+  const llm = getLLMClient();
+
+  if (llm && !injectFailure) {
+    const response = await llm.chat.completions.create({
+      model: LLM_MODELS.SYNTHESIZER,
+      messages: [{
+        role: "user",
+        content: `Synthesize this incident data into a report. Respond in strict JSON: {"summary":"string","probable_cause":"string","affected_systems":["string"],"next_actions":["string"],"ticket_id":"string"}\n\nData:\n${JSON.stringify(executionOutput, null, 2)}`,
+      }],
+    });
+
+    const parsed = parseLLMJson<SynthOutput>(response.choices[0]?.message?.content ?? "{}");
+    if (parsed?.summary) return parsed;
+    logger.error("LLM JSON parse failed, falling back to derived synthesis");
+  }
+
+  await sleep(1200);
+  return deriveSynthesisFromOutput(executionOutput, goal);
+}
+
+/**
+ * Phase 6: Derives a meaningful synthesis from actual MCP tool outputs.
+ * Parses content[0].text from each tool result instead of returning hardcoded strings.
+ */
+export function deriveSynthesisFromOutput(executionOutput: Record<string, unknown>, goal: string): SynthOutput {
+  let topError = "";
+  let affectedService = "";
+  let ticketId = `INC-${Math.floor(1000 + Math.random() * 9000)}`;
+  let thresholdBreach = "";
+  const nextActions: string[] = [];
+
+  for (const [key, value] of Object.entries(executionOutput)) {
+    const result = value as McpContentResult;
+    const text = result?.content?.[0]?.text;
+    if (!text) continue;
+
+    const parsed = parseLLMJson<Record<string, unknown>>(text);
+    if (!parsed) continue;
+
+    if (key.includes("search_logs")) {
+      const entries = parsed.entries as { message: string; severity: string }[] | undefined;
+      if (entries?.length) {
+        topError = entries.find((e) => e.severity === "error")?.message ?? entries[0].message ?? "";
+      }
+      affectedService = parsed.service as string ?? affectedService;
+    }
+
+    if (key.includes("get_metrics")) {
+      affectedService = parsed.service as string ?? affectedService;
+      if (parsed.threshold_breached) {
+        thresholdBreach = `${parsed.metric} at ${parsed.current}${parsed.unit} (threshold: ${parsed.threshold}${parsed.unit})`;
+        nextActions.push(`Investigate ${parsed.metric} breach on ${parsed.service}`);
+      }
+    }
+
+    if (key.includes("create_ticket")) {
+      ticketId = parsed.ticket_id as string ?? ticketId;
+    }
+  }
+
+  if (nextActions.length === 0) nextActions.push("Review logs for root cause", "Check metrics dashboard");
+  nextActions.push("Update runbook with incident details");
+
+  const summary = topError
+    ? `Incident detected on ${affectedService || "service"}: ${topError.slice(0, 120)}`
+    : `Service degradation detected for goal: ${goal.slice(0, 80)}`;
+
+  const probable_cause = thresholdBreach
+    ? `Threshold breach: ${thresholdBreach}`
+    : topError || "Root cause requires further investigation";
+
+  return {
+    summary,
+    probable_cause,
+    affected_systems: affectedService ? [affectedService] : ["unknown-service"],
+    next_actions: nextActions,
+    ticket_id: ticketId,
+  };
+}
+
+// ─── Orchestrator ─────────────────────────────────────────────────────────────
+
+export async function runTaskOrchestrator(taskId: string) {
+  const [task] = await db.select().from(tasks).where(eq(tasks.task_id, taskId));
+  if (!task) return;
+
+  return tracer.startActiveSpan("task.run", async (taskSpan) => {
+    taskSpan.setAttributes({ "task.id": taskId, "task.trace_id": task.trace_id, "task.goal": task.goal });
+
+    try {
+      await db.update(tasks)
+        .set({ status: "running", updated_at: new Date() })
+        .where(eq(tasks.task_id, taskId));
+      taskEventEmitter.emit(`task-update-${taskId}`, { status: "running" });
+
+      const done = await db.select().from(checkpoints)
+        .where(and(eq(checkpoints.task_id, taskId), eq(checkpoints.step_status, "success")));
+      const completedSteps = new Set(done.map((c) => c.step_number));
+
+      // Step 1 — Memory Retrieval
+      const memoryContext = completedSteps.has(1)
+        ? (done.find((c) => c.step_number === 1)?.output_data ?? {})
+        : await executeStep(taskId, 1, "memory_retrieval", { goal: task.goal },
+            () => memoryRetrievalHandler(task.goal));
+
+      // Step 2 — Planning
+      const planContext = completedSteps.has(2)
+        ? (done.find((c) => c.step_number === 2)?.output_data ?? {}) as PlanContext
+        : await executeStep(taskId, 2, "planner", { memoryContext },
+            () => plannerHandler(task.goal, task.context, task.task_type, task.inject_failure)) as PlanContext;
+
+      // Step 3 — MCP Tool Execution
+      const executionOutput = completedSteps.has(3)
+        ? (done.find((c) => c.step_number === 3)?.output_data ?? {}) as Record<string, unknown>
+        : await executeStep(taskId, 3, "execution", { planContext },
+            () => executionHandler(planContext, task.goal, task.inject_failure)) as Record<string, unknown>;
+
+      // Step 4 — Synthesis
+      const synthOutput = completedSteps.has(4)
+        ? (done.find((c) => c.step_number === 4)?.output_data ?? {}) as SynthOutput
+        : await executeStep(taskId, 4, "synthesizer", { executionOutput },
+            () => synthesizerHandler(executionOutput, task.goal, task.inject_failure)) as SynthOutput;
+
+      await db.update(tasks)
+        .set({ status: "completed", final_output: JSON.stringify(synthOutput, null, 2), updated_at: new Date() })
+        .where(eq(tasks.task_id, taskId));
+
+      // Write episodic memory using the actual synthesized summary
+      const memOutcome = synthOutput.summary ?? `Incident resolved: ${task.goal}`;
+      const embeddingVector = await embed(`${task.goal} ${memOutcome}`);
+      await db.insert(memories).values({
+        memory_id: crypto.randomUUID(),
+        task_id: taskId,
+        team_id: task.team_id ?? null,
+        goal: task.goal,
+        outcome: memOutcome,
+        score: synthOutput.probable_cause ? 0.9 : 0.6,
+        embedding: embeddingVector ?? undefined,
+      });
+
+      taskEventEmitter.emit(`task-update-${taskId}`, { status: "completed", final_output: JSON.stringify(synthOutput, null, 2) });
+      taskSpan.setStatus({ code: SpanStatusCode.OK });
+
+    } catch (error: unknown) {
+      const message = toErrorMessage(error);
+      logger.error({ taskId, err: error }, "Task orchestrator failed");
+      taskSpan.recordException(error instanceof Error ? error : new Error(message));
+      taskSpan.setStatus({ code: SpanStatusCode.ERROR, message });
+      await db.update(tasks)
+        .set({ status: "failed", error: message, updated_at: new Date() })
+        .where(eq(tasks.task_id, taskId));
+      taskEventEmitter.emit(`task-update-${taskId}`, { status: "failed", error: message });
+    } finally {
+      taskSpan.end();
+    }
+  });
+}
+
+export async function recoverStaleTasks() {
+  const stale = await db.select().from(tasks).where(inArray(tasks.status, ["running", "pending"]));
+  if (stale.length === 0) return;
+  logger.info({ count: stale.length }, "Recovering stale tasks from previous run");
+  for (const task of stale) {
+    await db.update(tasks)
+      .set({ status: "pending", error: null, updated_at: new Date() })
+      .where(eq(tasks.task_id, task.task_id));
+    setImmediate(() => runTaskOrchestrator(task.task_id));
   }
 }

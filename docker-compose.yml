@@ -1,10 +1,48 @@
 version: "3.8"
+
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: agentcore
+      POSTGRES_PASSWORD: agentcore
+      POSTGRES_DB: agentcore
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/init-pgvector.sql:/docker-entrypoint-initdb.d/init-pgvector.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentcore"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4318:4318"     # OTLP HTTP receiver
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
   app:
     build: .
     ports:
       - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
-      - NODE_ENV=production
-      # - OPENAI_API_KEY=YOUR_API_KEY_HERE
-      # - COMET_API_BASE_URL=https://api.cometapi.com/v1
+      NODE_ENV: production
+      DATABASE_URL: postgres://agentcore:agentcore@postgres:5432/agentcore
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      # OPENAI_API_KEY: your-key-here
+      # OPENAI_BASE_URL: https://api.openai.com/v1
+      # SLACK_BOT_TOKEN: xoxb-...
+      # SLACK_SIGNING_SECRET: ...
+      # MCP_SERVER_URL: ...
+      # JWT_SECRET: change-me-in-production
+
+volumes:
+  postgres_data:

@@ -1,6 +1,5 @@
 import { WebClient } from '@slack/web-api';
 import { logger } from './logger.js';
-import { inMemoryDB } from './db.js';
 
 let slackClient: WebClient | null = null;
 

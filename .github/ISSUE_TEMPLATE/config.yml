@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Discussion (questions, ideas, show-and-tell)
+    url: https://github.com/TheProdSDE/agentcore/discussions
+    about: For questions, usage help, or sharing how you've deployed AgentCore — use Discussions rather than Issues.
