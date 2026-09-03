@@ -1,11 +1,8 @@
 import path from "path";
-import { fileURLToPath } from "url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { logger } from "./logger.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 let mcpClient: Client | null = null;
 
@@ -16,7 +13,6 @@ export async function getMcpClient(): Promise<Client | null> {
 
   const remoteUrl = process.env.MCP_SERVER_URL;
   if (remoteUrl) {
-    // Production: connect to a remote MCP server over SSE/HTTP
     try {
       const transport = new SSEClientTransport(new URL(remoteUrl));
       await client.connect(transport);
@@ -29,11 +25,12 @@ export async function getMcpClient(): Promise<Client | null> {
     }
   }
 
-  // Dev / no external URL: spawn the bundled tools server as a subprocess over stdio
+  // Spawn the bundled tools server as a subprocess over stdio.
+  // Both dev and prod resolve from process.cwd() (the project root).
   try {
     const isDev = process.env.NODE_ENV !== "production";
     const toolsServerPath = isDev
-      ? path.resolve(__dirname, "../../tools/server.ts")
+      ? path.resolve(process.cwd(), "tools/server.ts")
       : path.resolve(process.cwd(), "dist/tools/server.cjs");
 
     const transport = new StdioClientTransport(

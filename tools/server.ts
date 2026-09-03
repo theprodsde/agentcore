@@ -371,5 +371,12 @@ function parseRange(range: string): number {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
+
+main().catch((err) => {
+  console.error("MCP tools server failed to start:", err);
+  process.exit(1);
+});
