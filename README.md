@@ -85,6 +85,44 @@ The core difference is **state and learning**:
 
 If any step fails, the task pauses. On resume, completed checkpoints are skipped — no redundant work, no re-running LLM calls.
 
+## Screenshots
+
+**Dashboard** — live task list with status badges, auto-refreshes every 5 seconds.
+
+![Dashboard](.github/assets/01-dashboard.png)
+
+---
+
+**Task Detail — Completed** — 4-step checkpoint timeline with per-step durations; AI-synthesized incident report on the right, derived from real MCP tool output.
+
+![Task Detail Completed](.github/assets/03-task-detail-completed.png)
+
+---
+
+**Task Detail — Failed with Resume** — when a step fails the task pauses and surfaces the exact error. "Resume from Checkpoint" replays from the failed step only — steps 1 and 2 are skipped.
+
+![Task Detail Failed](.github/assets/04-task-detail-failed.png)
+
+---
+
+**Create Task** — describe the incident goal, optionally paste log snippets or alert context, then hit Run. The full pipeline runs asynchronously.
+
+![Create Task](.github/assets/02-new-task.png)
+
+---
+
+**Episodic Memory** — every completed task writes its synthesized summary as an embedding. The search bar runs a pgvector cosine-similarity query to surface semantically similar past incidents.
+
+![Memory Explorer](.github/assets/05-memory-explorer.png)
+
+---
+
+**Scenarios Playground** — one-click flows to exercise failure + recovery and the episodic memory write path. Useful for onboarding or testing a fresh deployment.
+
+![Demo Scenarios](.github/assets/06-demo-scenarios.png)
+
+---
+
 ## Features
 
 | Feature | Detail |

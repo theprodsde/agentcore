@@ -52,7 +52,7 @@ export default function DemoScenarios() {
       <div className="mb-8 border-b border-slate-200 pb-6">
         <h1 className="text-2xl font-bold tracking-tight text-slate-900">Guided Demo Scenarios</h1>
         <p className="text-slate-500 mt-1">
-          Use these one-click scenarios to demonstrate core architectural differentiators to judging teams.
+          One-click scenarios that exercise each core capability end-to-end.
         </p>
       </div>
 
