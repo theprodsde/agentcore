@@ -1,9 +1,9 @@
 # AgentCore
 
 [![CI](https://github.com/TheProdSDE/agentcore/actions/workflows/ci.yml/badge.svg)](https://github.com/TheProdSDE/agentcore/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-57%20passing-brightgreen?logo=vitest&logoColor=white)](https://github.com/TheProdSDE/agentcore/actions)
+[![Tests](https://img.shields.io/badge/tests-127%20passing-brightgreen?logo=vitest&logoColor=white)](https://github.com/TheProdSDE/agentcore/actions)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![Node.js](https://img.shields.io/badge/Node.js-22-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-24-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-theprodsde-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://www.buymeacoffee.com/theprodsde)
 [![PayPal](https://img.shields.io/badge/PayPal-Donate-00457C?logo=paypal&logoColor=white)](https://www.paypal.com/paypalme/karangehlod)
@@ -77,7 +77,7 @@ The core difference is **state and learning**:
         ↓
   1. Memory Retrieval   — pgvector cosine similarity against past incidents
   2. LLM Planner        — selects tools from live manifest with per-tool args
-  3. MCP Tool Execution — search_logs, get_metrics, create_ticket, list_services
+  3. MCP Tool Execution — search_logs, get_metrics, search_runbook, create_ticket, list_services
   4. Synthesizer        — derives report from actual tool output, writes to memory
         ↓
 [Result posted to Slack thread / visible in Dashboard]
@@ -128,13 +128,19 @@ If any step fails, the task pauses. On resume, completed checkpoints are skipped
 | Feature | Detail |
 |---|---|
 | Checkpointed orchestration | Every step persists input/output to Postgres; resumes from last failed step |
-| pgvector semantic memory | Memories embedded with `text-embedding-3-small` and retrieved by cosine similarity |
-| Dynamic MCP tool selection | LLM planner receives live tool manifest and outputs per-tool args |
-| Real tool backends | `search_logs` → Loki, `get_metrics` → Prometheus, `create_ticket` → Linear (all fall back gracefully) |
+| pgvector semantic memory | Memories embedded with `text-embedding-3-small`, retrieved by cosine similarity with time-decay re-ranking |
+| Dynamic MCP tool selection | LLM planner receives live tool manifest and outputs per-tool args; 0/1 Knapsack DP prunes to fit time budget |
+| 5 built-in MCP tools | `search_logs` → Loki · `get_metrics` → Prometheus · `search_runbook` → runbook API · `create_ticket` → Linear · `list_services` |
+| Incident deduplication | Jaccard + bounded Levenshtein DP + LCS similarity — returns existing task if a match is found within 10 minutes |
 | OpenTelemetry tracing | Every step is a span; `trace_id`/`span_id` injected into every Pino log line |
 | JWT auth + multi-tenancy | HS256 tokens, per-team task/memory isolation; auth is a no-op when `JWT_SECRET` unset |
+| Webhook ingestion | PagerDuty, OpsGenie, Alertmanager — HMAC-verified payloads create tasks automatically |
 | Slack integration | `!incident <description>` triggers a full pipeline run; result posted back to thread |
-| Detailed health endpoint | `/api/health/detailed` checks DB latency, LLM config, MCP tools, OTel status |
+| Post-mortem export | `GET /api/tasks/:id/export.md` — downloadable Markdown post-mortem |
+| Metrics dashboard | `/metrics` page + `/api/metrics` endpoint — 30-day summary, step p95, weekly trend |
+| CLI | `node scripts/run.mjs "<goal>"` — run investigations from the terminal with live streaming |
+| Dry-run mode | `dry_run: true` — full pipeline without writing to memory or creating tickets |
+| Graceful shutdown | SIGTERM → flush OTel spans → drain DB pool → close MCP subprocess |
 
 ## Quickstart
 
@@ -159,7 +165,7 @@ docker run -d --name agentcore-pg -e POSTGRES_USER=agentcore \
   -e POSTGRES_PASSWORD=agentcore -e POSTGRES_DB=agentcore \
   -p 5432:5432 pgvector/pgvector:pg16
 docker exec agentcore-pg psql -U agentcore -d agentcore -c "CREATE EXTENSION IF NOT EXISTS vector;"
-npm run db:push
+npm run db:migrate    # apply versioned migrations (use db:push for quick local dev)
 npm run dev
 ```
 
@@ -167,7 +173,7 @@ npm run dev
 
 | Variable | Required | Description |
 |---|---|---|
-| `DATABASE_URL` | Yes | Postgres connection string |
+| `DATABASE_URL` | Yes | Postgres connection string (must have pgvector extension) |
 | `OPENAI_API_KEY` | For LLM steps | OpenAI-compatible key |
 | `OPENAI_BASE_URL` | No | Override API base (local models, etc.) |
 | `LLM_MODEL` | No | Model for planner + synthesizer (default: `gpt-4o-mini`) |
@@ -178,8 +184,13 @@ npm run dev
 | `MCP_SERVER_URL` | No | External MCP server (SSE). Unset = spawns bundled tools server |
 | `LOKI_URL` | No | Loki log backend for `search_logs` tool |
 | `PROMETHEUS_URL` | No | Prometheus backend for `get_metrics` tool |
+| `RUNBOOK_URL` | No | Runbook search API for `search_runbook` tool |
 | `LINEAR_API_KEY` | No | Linear ticket creation for `create_ticket` tool |
 | `LINEAR_TEAM_ID` | No | Linear team ID |
+| `PAGERDUTY_WEBHOOK_SECRET` | No | HMAC secret for PagerDuty webhook verification |
+| `OPSGENIE_WEBHOOK_SECRET` | No | HMAC secret for OpsGenie webhook verification |
+| `ALERTMANAGER_SECRET` | No | Shared secret header for Alertmanager webhook |
+| `TOOL_BUDGET_MS` | No | Max total tool execution time per task in ms (default: `15000`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTLP endpoint for Jaeger/Grafana Tempo |
 | `LOG_LEVEL` | No | Pino log level (default: `warn`) |
 
@@ -208,29 +219,39 @@ Tasks and memories are isolated per team. A token from team A cannot read team B
 ## Project structure
 
 ```
-server.ts               Express entry point — mounts routes, handles Slack, starts server
+server.ts               Express entry point — mounts routes, handles Slack, graceful shutdown
+scripts/
+  run.mjs               CLI — run investigations from the terminal with live streaming
 src/
+  components/
+    ErrorBoundary.tsx   React error boundary — catches render errors, shows fallback UI
   routes/               Route handlers (one file per domain)
     auth.ts             POST /api/teams, POST /api/auth/token, POST /api/teams/:id/api-keys
-    health.ts           GET /api/health, GET /api/health/detailed
-    tasks.ts            CRUD + SSE stream + resume
-    memory.ts           Memory retrieval + pgvector semantic query
+    health.ts           GET /api/health, GET /api/health/detailed (parallel checks)
+    tasks.ts            CRUD + SSE stream + resume + post-mortem export + incident dedup
+    memory.ts           Memory retrieval + pgvector semantic query (paginated)
+    metrics.ts          GET /api/metrics — 30-day summary, step p95, weekly trend (cached)
+    webhooks.ts         POST /api/webhooks/{pagerduty,opsgenie,alertmanager} (HMAC-verified)
   server/
-    executor.ts         Orchestrator + four step handlers (individually exported + testable)
+    executor.ts         Orchestrator + step handlers + 0/1 Knapsack tool selection
     auth.ts             JWT middleware, token signing, API key hashing
+    cache.ts            LRU TTL cache (doubly-linked list + HashMap) for tool results
     llm.ts              Shared OpenAI client singleton + model constants
-    embeddings.ts       text-embedding-3-small wrapper with null fallback
+    embeddings.ts       text-embedding-3-small wrapper with LRU memoization
     mcp.ts              MCP client — spawns tools/server.ts via stdio or connects via SSE
     telemetry.ts        OTel provider + tracer export
     logger.ts           Pino logger with trace_id/span_id mixin
-    db/                 Drizzle schema + connection
+    db/                 Drizzle schema + connection (pgvector, 5 indexes)
   utils/
     index.ts            parseLLMJson, generateTraceId, toErrorMessage
+    algorithms.ts       Levenshtein DP, bounded DP, LCS, top-k heap, LRU, Jaccard, Knapsack
+    synthesis.ts        deriveSynthesisFromOutput — pure function, no infrastructure deps
 tools/
-  server.ts             MCP tool server — search_logs, get_metrics, create_ticket, list_services
+  server.ts             MCP tool server — search_logs, get_metrics, search_runbook, create_ticket, list_services
   README.md             How to add tools and connect real backends
 tests/
   unit/
+    algorithms.test.ts  127 tests: Levenshtein, LCS, Knapsack, top-k, Jaccard, LRU, similarity
     auth.test.ts        JWT, API key hashing, middleware
     executor.test.ts    deriveSynthesisFromOutput, planner/synthesizer output contracts
     tools.test.ts       parseRange, filter logic, metric simulation, output shapes

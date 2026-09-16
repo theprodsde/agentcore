@@ -4,44 +4,95 @@
 
 **Platform foundation**
 - Environment and config with Zod validation
-- In-memory task, checkpoint, and memory stores
-- Structured logging via Pino
+- Structured logging via Pino with OTel trace correlation
+- Postgres via Drizzle ORM (replaced in-memory stores)
+- DB connection pool with idle/connect timeouts
+- Graceful shutdown (SIGTERM → flush OTel → drain pool → close MCP subprocess)
 
 **Orchestration core**
 - 4-step pipeline: memory retrieval → planning → MCP tool execution → synthesis
 - Per-step checkpointing with resume from last failed step
+- Crash recovery on boot (`recoverStaleTasks` bulk UPDATE)
 - OpenAI-compatible LLM client (planner + synthesizer)
-- MCP client integration via `@modelcontextprotocol/sdk`
+- MCP client — spawns local tools server via stdio or connects via SSE
+- 0/1 Knapsack DP for optimal tool selection within a time budget
+- Parallel tool execution via `Promise.all`
 
 **Task lifecycle**
-- Task creation, listing, and detail APIs
-- Live step-by-step status stream (SSE)
+- Task creation, listing (paginated), detail, and checkpoint APIs
+- Incident deduplication (Jaccard + bounded Levenshtein + LCS similarity)
+- Dry-run mode (full pipeline, skips side effects)
+- Live step-by-step status stream (SSE with 10-min auto-close)
 - Manual resume API for failed tasks
+- Post-mortem Markdown export (`/api/tasks/:id/export.md`)
 
 **Memory system**
-- Episodic memory write on task completion
-- Memory retrieval API
-- Memory-enriched planning (loaded into planner context)
+- Episodic memory write with outcome-based scoring
+- pgvector cosine similarity retrieval with time-decay re-ranking
+- Semantic memory query API (`<=>` operator)
+- LRU embed cache (doubly-linked list + HashMap, 256-entry cap)
+
+**MCP tool layer**
+- `search_logs` → Loki backend or contextual simulation
+- `get_metrics` → Prometheus backend or contextual simulation
+- `search_runbook` → runbook API or keyword-based simulation
+- `create_ticket` → Linear API or simulation
+- `list_services` → simulation with realistic degraded/healthy mix
+- Zod validation on all tool args; TOOL_REGISTRY map pattern
+- Tool manifest cached for process lifetime
+
+**Auth + multi-tenancy**
+- HS256 JWT via `jose` — 24-hour TTL
+- Teams and API key table (SHA-256 hashed keys)
+- Per-team task, memory, and metric isolation
+- Auth no-op when `JWT_SECRET` unset (dev mode)
+
+**Webhook ingestion**
+- PagerDuty `incident.trigger` → task (HMAC-SHA256 verified)
+- OpsGenie `Create` → task (HMAC verified)
+- Prometheus Alertmanager firing alerts → tasks (shared-secret header)
 
 **Integrations**
-- Slack event ingestion (`!incident <description>` trigger)
-- Slack Block Kit response formatting
-- Slack working memory per channel
+- Slack `!incident <description>` trigger → full pipeline → thread reply
+- Webhook ingestion from PagerDuty, OpsGenie, Alertmanager
+
+**Observability**
+- OpenTelemetry — every task is a root span, every step a child span
+- Pino `mixin()` injects `trace_id`/`span_id` on every log line
+- Jaeger in `docker-compose.yml` (OTLP port 4318)
+- Detailed health endpoint (parallel DB + MCP checks)
 
 **Frontend**
-- React SPA with React Router
-- Dashboard, Task Detail with checkpoint timeline, Memory Explorer
-- Demo scenario page (pre-built one-click flows)
+- React SPA (React Router, Tailwind CSS)
+- Dashboard with smart polling (stops when all tasks terminal)
+- Task detail — incident report (structured cards, not raw JSON), checkpoint timeline
+- Memory Explorer with functional search (`useMemo` filtering)
+- Metrics dashboard — KPI cards, weekly bar chart, step p95 breakdown
+- Demo scenarios with error display and `useCallback`
+- React Error Boundary on all routes
+- SSE stream in TaskDetail (replaces 2s polling)
+
+**CLI**
+- `node scripts/run.mjs "<goal>"` — live checkpoint streaming, structured output, 0/1 exit codes
+
+**Testing**
+- 127 unit tests (5 files) — algorithms, auth, executor, tools, utils
+- CI: typecheck → test → build → Docker (Node 24)
+
+**5 DB indexes**
+- `idx_checkpoints_task_id_status` — covers all checkpoint lookups
+- `idx_checkpoints_success` — partial index for metrics p95 queries
+- `idx_tasks_team_id` — multi-tenant task list
+- `idx_tasks_created_at_status` — dedup window query
+- `idx_memories_team_id_created_at` — paginated memory retrieval
 
 ---
 
 ## Up next
 
-- [ ] **Persistent storage** — swap `inMemoryDB` for Postgres (Drizzle ORM) + Redis for the task queue; tasks survive restarts
-- [ ] **Observability** — OpenTelemetry traces per task; exportable to Jaeger / Grafana Tempo
-- [ ] **Real MCP tools** — connect to actual log-search, metrics, and alerting tool servers
-- [ ] **Semantic memory retrieval** — replace word-frequency similarity with vector embeddings (pgvector)
-- [ ] **Auth** — JWT-based API auth; per-user task isolation
-- [ ] **Webhook replay** — Slack signing secret verification and retry deduplication
-- [ ] **Multi-step planner** — allow the planner to emit dynamic tool lists rather than a fixed 4-step pipeline
-- [ ] **CLI** — `agentcore run "<incident description>"` for scripted/CI use
+- [ ] `eslint` + `prettier` added to CI
+- [ ] `CONTRIBUTING.md` with branch naming and PR guide
+- [ ] Redis for the task queue (multi-instance deployments)
+- [ ] Slack app-home tab showing tasks inline
+- [ ] Runbook auto-import from Confluence / Notion at startup
+- [ ] pgvector-based dedup (replace JS Jaccard+edit with a single DB query)
