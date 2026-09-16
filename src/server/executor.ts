@@ -3,16 +3,18 @@ import crypto from "crypto";
 import { eq, and, inArray, sql, desc } from "drizzle-orm";
 import { db, tasks, checkpoints, memories } from "./db/index";
 import { logger } from "./logger";
-import { getMcpClient, executeMcpTool, listMcpTools } from "./mcp";
+import { getMcpClient, executeMcpTool, getMcpToolSummary } from "./mcp";
 import { embed } from "./embeddings";
 import { getLLMClient, LLM_MODELS } from "./llm";
 import { tracer, SpanStatusCode } from "./telemetry";
 import { parseLLMJson, toErrorMessage } from "../utils/index";
 import { deriveSynthesisFromOutput, type SynthOutput } from "../utils/synthesis";
 import { getCached, setCached, toolCacheKey } from "./cache";
+import { topK } from "../utils/algorithms";
 export { deriveSynthesisFromOutput } from "../utils/synthesis";
 
 export const taskEventEmitter = new EventEmitter();
+taskEventEmitter.setMaxListeners(100); // many concurrent SSE clients per task
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -37,9 +39,11 @@ async function executeStep(
   stepNumber: number,
   stepName: string,
   inputData: unknown,
-  runLogic: () => Promise<unknown>
+  runLogic: () => Promise<unknown>,
+  // Pass the already-loaded task to avoid a redundant SELECT on every step (C-1)
+  preloadedTask?: typeof tasks.$inferSelect
 ): Promise<unknown> {
-  const [task] = await db.select().from(tasks).where(eq(tasks.task_id, taskId));
+  const task = preloadedTask ?? (await db.select().from(tasks).where(eq(tasks.task_id, taskId)))[0];
   if (!task) return null;
 
   return tracer.startActiveSpan(`step.${stepName}`, async (span) => {
@@ -109,22 +113,22 @@ export async function memoryRetrievalHandler(goal: string): Promise<Record<strin
   let related: typeof memories.$inferSelect[] = [];
 
   if (queryEmbedding) {
-    // Fetch top 10 by cosine similarity, then re-rank with time-decay weighting
+    // Fetch top 20 by cosine similarity, then re-rank with time-decay weighting
+    // using top-k selection (O(n·log k)) instead of full sort (O(n log n))
     const candidates = await db.select().from(memories)
       .where(sql`${memories.embedding} IS NOT NULL`)
       .orderBy(sql`${memories.embedding} <=> ${JSON.stringify(queryEmbedding)}::vector`)
-      .limit(10);
+      .limit(20);
 
     const now = Date.now();
     const HALF_LIFE_MS = 180 * 24 * 60 * 60 * 1000; // 180 days
 
-    related = candidates
-      .map((m) => ({
-        ...m,
-        _effective_score: m.score * Math.exp(-(now - new Date(m.created_at).getTime()) / HALF_LIFE_MS),
-      }))
-      .sort((a, b) => b._effective_score - a._effective_score)
-      .slice(0, 3);
+    const scored = candidates.map((m) => ({
+      ...m,
+      _effective_score: m.score * Math.exp(-(now - new Date(m.created_at).getTime()) / HALF_LIFE_MS),
+    }));
+
+    related = topK(scored, 3, (m) => m._effective_score);
   } else {
     related = await db.select().from(memories).orderBy(desc(memories.created_at)).limit(3);
   }
@@ -146,14 +150,9 @@ export async function plannerHandler(
   const llm = getLLMClient();
 
   if (llm && !injectFailure) {
-    const toolList = await listMcpTools().catch(() => []);
-    const toolSummary = toolList.length > 0
-      ? toolList.map((t) => {
-          const schema = t.inputSchema as { properties?: Record<string, { type: string }> } | undefined;
-          const params = Object.entries(schema?.properties ?? {}).map(([k, v]) => `${k}(${v.type})`).join(", ");
-          return `- ${t.name}(${params}): ${t.description}`;
-        }).join("\n")
-      : "search_logs(service, query), get_metrics(service, metric), search_runbook(query), create_ticket(title, description, severity), list_services()";
+    // getMcpToolSummary() returns a cached string — built once per process lifetime
+    const toolSummary = await getMcpToolSummary().catch(() => null)
+      ?? "search_logs(service, query), get_metrics(service, metric), search_runbook(query), create_ticket(title, description, severity), list_services()";
 
     const dryNote = dryRun ? "\nNote: this is a dry run — do NOT include create_ticket in tool_calls." : "";
     const response = await llm.chat.completions.create({
@@ -314,27 +313,31 @@ export async function runTaskOrchestrator(taskId: string) {
 
       const done = await db.select().from(checkpoints)
         .where(and(eq(checkpoints.task_id, taskId), eq(checkpoints.step_status, "success")));
-      const completedSteps = new Set(done.map((c) => c.step_number));
 
+      // Map for O(1) lookup instead of repeated O(n) done.find() scans
+      const doneMap = new Map(done.map((c) => [c.step_number, c]));
+      const completedSteps = new Set(doneMap.keys());
+
+      // Pass task to each step to avoid a redundant DB fetch per step (C-1: 5×→1× SELECT)
       const memoryContext = completedSteps.has(1)
-        ? (done.find((c) => c.step_number === 1)?.output_data ?? {})
+        ? (doneMap.get(1)?.output_data ?? {})
         : await executeStep(taskId, 1, "memory_retrieval", { goal: task.goal },
-            () => memoryRetrievalHandler(task.goal));
+            () => memoryRetrievalHandler(task.goal), task);
 
       const planContext = completedSteps.has(2)
-        ? (done.find((c) => c.step_number === 2)?.output_data ?? {}) as PlanContext
+        ? (doneMap.get(2)?.output_data ?? {}) as PlanContext
         : await executeStep(taskId, 2, "planner", { memoryContext },
-            () => plannerHandler(task.goal, task.context, task.task_type, task.inject_failure, task.dry_run)) as PlanContext;
+            () => plannerHandler(task.goal, task.context, task.task_type, task.inject_failure, task.dry_run), task) as PlanContext;
 
       const executionOutput = completedSteps.has(3)
-        ? (done.find((c) => c.step_number === 3)?.output_data ?? {}) as Record<string, unknown>
+        ? (doneMap.get(3)?.output_data ?? {}) as Record<string, unknown>
         : await executeStep(taskId, 3, "execution", { planContext },
-            () => executionHandler(planContext, task.goal, task.inject_failure)) as Record<string, unknown>;
+            () => executionHandler(planContext, task.goal, task.inject_failure), task) as Record<string, unknown>;
 
       const synthOutput = completedSteps.has(4)
-        ? (done.find((c) => c.step_number === 4)?.output_data ?? {}) as SynthOutput
+        ? (doneMap.get(4)?.output_data ?? {}) as SynthOutput
         : await executeStep(taskId, 4, "synthesizer", { executionOutput },
-            () => synthesizerHandler(executionOutput, task.goal, task.inject_failure)) as SynthOutput;
+            () => synthesizerHandler(executionOutput, task.goal, task.inject_failure), task) as SynthOutput;
 
       await db.update(tasks)
         .set({ status: "completed", final_output: JSON.stringify(synthOutput, null, 2), updated_at: new Date() })
@@ -379,10 +382,11 @@ export async function recoverStaleTasks() {
   const stale = await db.select().from(tasks).where(inArray(tasks.status, ["running", "pending"]));
   if (stale.length === 0) return;
   logger.info({ count: stale.length }, "Recovering stale tasks from previous run");
-  for (const task of stale) {
-    await db.update(tasks)
-      .set({ status: "pending", error: null, updated_at: new Date() })
-      .where(eq(tasks.task_id, task.task_id));
-    setImmediate(() => runTaskOrchestrator(task.task_id));
-  }
+
+  // Single bulk UPDATE instead of N sequential writes — O(1) round-trip vs O(N)
+  await db.update(tasks)
+    .set({ status: "pending", error: null, updated_at: new Date() })
+    .where(inArray(tasks.task_id, stale.map(t => t.task_id)));
+
+  stale.forEach(t => setImmediate(() => runTaskOrchestrator(t.task_id)));
 }

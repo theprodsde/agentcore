@@ -1,10 +1,17 @@
 import { Router } from "express";
 import { eq, sql, gte, and } from "drizzle-orm";
 import { db, tasks, checkpoints } from "../server/db/index.js";
+import { getCached, setCached } from "../server/cache.js";
 
 export const metricsRouter = Router();
 
+const METRICS_TTL_MS = 60 * 1000; // 60 s — data changes at most once per task completion
+
 metricsRouter.get("/metrics", async (req, res) => {
+  const cacheKey = `metrics:${req.teamId ?? "global"}`;
+  const cached = getCached(cacheKey);
+  if (cached) return res.json(cached);
+
   const teamFilter = req.teamId ? eq(tasks.team_id, req.teamId) : undefined;
   const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
   const since = teamFilter
@@ -19,7 +26,7 @@ metricsRouter.get("/metrics", async (req, res) => {
     avg_retries: sql<number>`AVG(resume_count)`,
   }).from(tasks).where(since);
 
-  // Average duration per step across all completed checkpoints
+  // Step stats bounded to the same 30-day window to avoid full-table scans
   const stepStats = await db.select({
     step_name:    checkpoints.step_name,
     avg_ms:       sql<number>`AVG(duration_ms)`,
@@ -27,7 +34,7 @@ metricsRouter.get("/metrics", async (req, res) => {
     count:        sql<number>`COUNT(*)`,
   })
     .from(checkpoints)
-    .where(eq(checkpoints.step_status, "success"))
+    .where(and(eq(checkpoints.step_status, "success"), gte(checkpoints.created_at, thirtyDaysAgo)))
     .groupBy(checkpoints.step_name)
     .orderBy(checkpoints.step_name);
 
@@ -50,7 +57,7 @@ metricsRouter.get("/metrics", async (req, res) => {
   const total = Number(taskSummary?.total ?? 0);
   const completed = Number(taskSummary?.completed ?? 0);
 
-  return res.json({
+  const response = {
     period: "last_30_days",
     summary: {
       total_tasks:    total,
@@ -76,5 +83,9 @@ metricsRouter.get("/metrics", async (req, res) => {
         : 0,
       avg_ttc_s:   w.avg_ttc_ms ? parseFloat((Number(w.avg_ttc_ms) / 1000).toFixed(1)) : null,
     })),
-  });
+  };
+
+  // Cache the result — metrics change only when a task completes (every few minutes)
+  setCached(cacheKey, response, METRICS_TTL_MS);
+  return res.json(response);
 });

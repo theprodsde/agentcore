@@ -35,7 +35,7 @@ import { logger } from "./src/server/logger.js";
 import { sendSlackResponse } from "./src/server/slack.js";
 import { db, tasks } from "./src/server/db/index.js";
 import { runTaskOrchestrator, recoverStaleTasks } from "./src/server/executor.js";
-import { listMcpTools } from "./src/server/mcp.js";
+import { listMcpTools, closeMcpClient } from "./src/server/mcp.js";
 import { getLLMClient, LLM_MODELS } from "./src/server/llm.js";
 import { authMiddleware, isAuthEnabled } from "./src/server/auth.js";
 import { parseLLMJson, generateTraceId, toErrorMessage } from "./src/utils/index.js";
@@ -76,17 +76,21 @@ app.post("/api/slack/events", async (req, res) => {
 
       await sendSlackResponse(event.channel, event.ts, [], `*Task Enqueued:* \`${traceId}\`\nWorking on: ${goal}...`);
 
-      try {
-        await runTaskOrchestrator(newTask.task_id);
-        const [finalTask] = await db.select().from(tasks).where(eq(tasks.task_id, newTask.task_id));
-        if (finalTask?.status === "completed") {
-          await sendSlackResponse(event.channel, event.ts, [], `*Task Completed:* \`${traceId}\`\n\n${finalTask.final_output}`);
-        } else if (finalTask?.status === "failed") {
-          await sendSlackResponse(event.channel, event.ts, [], `*Task Failed:* \`${traceId}\`\nError: ${finalTask.error}`);
+      // Use setImmediate so the Slack event handler returns immediately — same pattern
+      // as POST /api/tasks. Avoids blocking on a multi-minute orchestration pipeline.
+      setImmediate(async () => {
+        try {
+          await runTaskOrchestrator(newTask.task_id);
+          const [finalTask] = await db.select().from(tasks).where(eq(tasks.task_id, newTask.task_id));
+          if (finalTask?.status === "completed") {
+            await sendSlackResponse(event.channel, event.ts, [], `*Task Completed:* \`${traceId}\`\n\n${finalTask.final_output}`);
+          } else if (finalTask?.status === "failed") {
+            await sendSlackResponse(event.channel, event.ts, [], `*Task Failed:* \`${traceId}\`\nError: ${finalTask.error}`);
+          }
+        } catch (err) {
+          logger.error({ err }, "Task orchestrator failed from Slack event");
         }
-      } catch (err) {
-        logger.error({ err }, "Task orchestrator failed from Slack event");
-      }
+      });
     }
   }
 });
@@ -146,7 +150,7 @@ app.post("/api/simulate", async (req, res) => {
       temperature: 0.2,
       response_format: { type: "json_object" },
     });
-    const data = parseLLMJson(completion.choices[0].message.content || "{}");
+    const data = parseLLMJson(completion.choices?.[0]?.message?.content ?? "{}");
     return res.json({ ...(data as object), traceId, fallbackMode: false });
   } catch (err) {
     return res.status(500).json({ error: "Simulation pipeline failed", details: toErrorMessage(err) });
@@ -178,10 +182,31 @@ async function startServer() {
     app.get("*", (_req, res) => res.sendFile(path.join(distPath, "index.html")));
   }
 
-  app.listen(config.PORT, "0.0.0.0", async () => {
+  const httpServer = app.listen(config.PORT, "0.0.0.0", async () => {
     console.log(`AgentCore running on http://localhost:${config.PORT}`);
     await recoverStaleTasks();
   });
+
+  // ─── Graceful shutdown ──────────────────────────────────────────────────────
+  // On SIGTERM/SIGINT: flush OTel spans, close DB pool, kill MCP subprocess,
+  // stop accepting new connections.
+
+  const { tracer: _t, trace, context: _c } = await import("./src/server/telemetry.js");
+  const otelProvider = (trace as unknown as { getTracerProvider: () => { forceFlush?: () => Promise<void> } }).getTracerProvider();
+  const { db: pgDb } = await import("./src/server/db/index.js");
+
+  async function shutdown(signal: string) {
+    logger.info({ signal }, "Graceful shutdown initiated");
+    httpServer.close();
+    await otelProvider.forceFlush?.().catch(() => {});
+    await closeMcpClient();
+    // postgres-js exposes end() to drain the pool
+    await (pgDb as unknown as { $client: { end: () => Promise<void> } }).$client.end().catch(() => {});
+    process.exit(0);
+  }
+
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT",  () => void shutdown("SIGINT"));
 }
 
 startServer();

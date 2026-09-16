@@ -15,6 +15,13 @@
       "when": 1789489341553,
       "tag": "0001_glossy_the_captain",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789544675370,
+      "tag": "0002_slimy_toad",
+      "breakpoints": true
     }
   ]
 }

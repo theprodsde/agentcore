@@ -2,6 +2,7 @@ import { Router } from "express";
 import { eq, ne, desc, sql } from "drizzle-orm";
 import { db, memories } from "../server/db/index.js";
 import { embed } from "../server/embeddings.js";
+import { topK } from "../utils/algorithms.js";
 
 export const memoryRouter = Router();
 
@@ -12,14 +13,21 @@ memoryRouter.get("/tasks/:task_id/memory", async (req, res) => {
 });
 
 memoryRouter.get("/memory", async (req, res) => {
+  const pageSize = Math.min(Math.max(1, Number(req.query.limit) || 50), 200);
+  const offset   = Math.max(0, Number(req.query.offset) || 0);
+
   const rows = req.teamId
-    ? await db.select().from(memories).where(eq(memories.team_id, req.teamId)).orderBy(desc(memories.created_at))
-    : await db.select().from(memories).orderBy(desc(memories.created_at));
-  return res.json({ items: rows });
+    ? await db.select().from(memories).where(eq(memories.team_id, req.teamId))
+        .orderBy(desc(memories.created_at)).limit(pageSize).offset(offset)
+    : await db.select().from(memories)
+        .orderBy(desc(memories.created_at)).limit(pageSize).offset(offset);
+
+  return res.json({ items: rows, limit: pageSize, offset });
 });
 
 memoryRouter.post("/memory/query", async (req, res) => {
-  const { query, limit = 5 } = req.body;
+  const { query } = req.body;
+  const limit = Math.min(Math.max(1, Number(req.body.limit) || 5), 50); // clamp 1–50
   if (!query) return res.status(400).json({ error: "query is required" });
 
   try {
@@ -48,14 +56,16 @@ memoryRouter.post("/memory/query", async (req, res) => {
       : await db.select().from(memories).limit(100);
 
     const words = query.toLowerCase().split(/\W+/).filter((w: string) => w.length > 2);
-    const scored = allRows
-      .map((m) => {
-        const text = `${m.goal} ${m.outcome}`.toLowerCase();
-        const hits = words.filter((w: string) => text.includes(w)).length;
+    // Pre-build a Set per row so membership is O(1) per word — was O(T) per word with includes()
+    const scored = topK(
+      allRows.map((m) => {
+        const textWords = new Set(`${m.goal} ${m.outcome}`.toLowerCase().split(/\W+/));
+        const hits = words.filter((w: string) => textWords.has(w)).length;
         return { ...m, similarity: Math.min(1.0, 0.15 + (hits / Math.max(words.length, 3)) * 0.85) };
-      })
-      .sort((a, b) => b.similarity - a.similarity)
-      .slice(0, limit);
+      }),
+      limit,
+      (m) => m.similarity
+    );
 
     return res.json({ matches: scored, backend: "word-frequency" });
   } catch (err) {

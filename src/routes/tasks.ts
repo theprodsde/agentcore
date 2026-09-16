@@ -2,8 +2,9 @@ import { Router } from "express";
 import { eq, desc, and, gte, sql } from "drizzle-orm";
 import { db, tasks, checkpoints } from "../server/db/index.js";
 import { runTaskOrchestrator, taskEventEmitter } from "../server/executor.js";
-import { embed } from "../server/embeddings.js";
+import { getLLMClient } from "../server/llm.js";
 import { generateTraceId } from "../utils/index.js";
+import { jaccardSimilarity, editSimilarity } from "../utils/algorithms.js";
 
 export const tasksRouter = Router();
 
@@ -16,7 +17,8 @@ tasksRouter.post("/tasks", async (req, res) => {
   // Incident deduplication: if a semantically similar task is already running or
   // pending (created within the last 10 minutes), return it instead of creating
   // a duplicate investigation.
-  if (!inject_failure && !dry_run) {
+  // Uses combined Levenshtein DP (30%) + Jaccard word-overlap (70%) — see src/utils/algorithms.ts
+  if (!inject_failure && !dry_run && getLLMClient()) {
     try {
       const tenMinsAgo = new Date(Date.now() - 10 * 60 * 1000);
       const recentActive = await db.select().from(tasks)
@@ -29,27 +31,21 @@ tasksRouter.post("/tasks", async (req, res) => {
         .orderBy(desc(tasks.created_at))
         .limit(20);
 
-      if (recentActive.length > 0) {
-        const goalEmbedding = await embed(goal);
-        if (goalEmbedding) {
-          // Compare cosine similarity in JS since we don't have embeddings on tasks
-          // Use word-overlap as a fast heuristic before embedding comparison
-          const goalWords = new Set(goal.toLowerCase().split(/\W+/).filter((w: string) => w.length > 3));
-          for (const t of recentActive) {
-            const tWords = new Set(t.goal.toLowerCase().split(/\W+/).filter((w: string) => w.length > 3));
-            const intersection = [...goalWords].filter(w => tWords.has(w as string)).length;
-            const union = new Set([...goalWords, ...tWords]).size;
-            const jaccard = union > 0 ? intersection / union : 0;
-            if (jaccard >= 0.6) {
-              return res.status(200).json({
-                task_id: t.task_id,
-                status: t.status,
-                trace_id: t.trace_id,
-                correlated: true,
-                message: `Similar incident already being investigated (${Math.round(jaccard * 100)}% match). Returning existing task.`,
-              });
-            }
-          }
+      // Pre-compute goal word set once — not inside the loop (E-2 DP memoization fix)
+      const goalWords = new Set<string>(goal.toLowerCase().split(/\W+/).filter(w => w.length > 3));
+
+      for (const t of recentActive) {
+        const tWords = new Set(t.goal.toLowerCase().split(/\W+/).filter(w => w.length > 3));
+        // Combined: 70% Jaccard word-overlap + 30% Levenshtein edit distance
+        const similarity = jaccardSimilarity(goalWords, tWords) * 0.7 + editSimilarity(goal, t.goal) * 0.3;
+        if (similarity >= 0.6) {
+          return res.status(200).json({
+            task_id: t.task_id,
+            status: t.status,
+            trace_id: t.trace_id,
+            correlated: true,
+            message: `Similar incident already being investigated (${Math.round(similarity * 100)}% match). Returning existing task.`,
+          });
         }
       }
     } catch {
@@ -79,13 +75,19 @@ tasksRouter.post("/tasks", async (req, res) => {
   });
 });
 
-// ─── Task list ─────────────────────────────────────────────────────────────────
+// ─── Task list (paginated) ────────────────────────────────────────────────────
 
 tasksRouter.get("/tasks", async (req, res) => {
+  const pageSize = Math.min(Math.max(1, Number(req.query.limit) || 50), 200);
+  const offset   = Math.max(0, Number(req.query.offset) || 0);
+
   const rows = req.teamId
-    ? await db.select().from(tasks).where(eq(tasks.team_id, req.teamId)).orderBy(desc(tasks.created_at))
-    : await db.select().from(tasks).orderBy(desc(tasks.created_at));
-  return res.json({ items: rows });
+    ? await db.select().from(tasks).where(eq(tasks.team_id, req.teamId))
+        .orderBy(desc(tasks.created_at)).limit(pageSize).offset(offset)
+    : await db.select().from(tasks)
+        .orderBy(desc(tasks.created_at)).limit(pageSize).offset(offset);
+
+  return res.json({ items: rows, limit: pageSize, offset });
 });
 
 tasksRouter.get("/tasks/:task_id", async (req, res) => {
@@ -102,6 +104,8 @@ tasksRouter.get("/tasks/:task_id/checkpoints", async (req, res) => {
   return res.json({ task_id: req.params.task_id, checkpoints: rows });
 });
 
+const SSE_TIMEOUT_MS = 10 * 60 * 1000; // 10 min — prevents zombie connections
+
 tasksRouter.get("/tasks/:task_id/stream", (req, res) => {
   const { task_id } = req.params;
   res.setHeader("Content-Type", "text/event-stream");
@@ -112,10 +116,19 @@ tasksRouter.get("/tasks/:task_id/stream", (req, res) => {
   const onUpdate = (data: unknown) => res.write(`data: ${JSON.stringify(data)}\n\n`);
   taskEventEmitter.on(`checkpoint-${task_id}`, onUpdate);
   taskEventEmitter.on(`task-update-${task_id}`, onUpdate);
-  req.on("close", () => {
+
+  // Auto-close if a task stays stuck and the client never disconnects
+  const timeout = setTimeout(() => {
+    res.write(`data: {"timeout":true}\n\n`);
+    res.end();
+  }, SSE_TIMEOUT_MS);
+
+  const cleanup = () => {
+    clearTimeout(timeout);
     taskEventEmitter.off(`checkpoint-${task_id}`, onUpdate);
     taskEventEmitter.off(`task-update-${task_id}`, onUpdate);
-  });
+  };
+  req.on("close", cleanup);
 });
 
 // ─── Resume ────────────────────────────────────────────────────────────────────

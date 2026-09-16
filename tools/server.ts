@@ -18,7 +18,38 @@ import "dotenv/config";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { z } from "zod";
+import { z, ZodError } from "zod";
+
+// ─── Zod schemas for tool arg validation (G-2) ───────────────────────────────
+const SearchLogsSchema = z.object({
+  service:    z.string(),
+  query:      z.string(),
+  severity:   z.enum(["error", "warn", "info", "debug"]).optional(),
+  limit:      z.number().int().positive().max(100).default(20),
+  time_range: z.string().optional().default("1h"),
+});
+
+const GetMetricsSchema = z.object({
+  service:    z.string(),
+  metric:     z.string(),
+  time_range: z.string().optional().default("1h"),
+});
+
+const CreateTicketSchema = z.object({
+  title:            z.string(),
+  description:      z.string(),
+  severity:         z.enum(["critical", "high", "medium", "low"]),
+  affected_service: z.string().optional(),
+});
+
+const ListServicesSchema = z.object({
+  filter_status: z.enum(["all", "degraded", "down"]).optional().default("all"),
+});
+
+const SearchRunbookSchema = z.object({
+  query:   z.string(),
+  service: z.string().optional(),
+});
 
 const server = new Server({ name: "agentcore-tools", version: "1.0.0" }, {
   capabilities: { tools: {} },
@@ -97,21 +128,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 // ─── Tool handlers ────────────────────────────────────────────────────────────
 
-// Tool registry — add new tools here without touching the dispatch loop
+// Tool registry — add new tools here without touching the dispatch loop.
+// Each entry parses + validates args with Zod before calling the handler (G-2).
 const TOOL_REGISTRY: Record<string, (args: unknown) => Promise<unknown>> = {
-  search_logs:    (args) => searchLogs(args as SearchLogsArgs),
-  get_metrics:    (args) => getMetrics(args as GetMetricsArgs),
-  create_ticket:  (args) => createTicket(args as CreateTicketArgs),
-  list_services:  (args) => listServices(args as ListServicesArgs),
-  search_runbook: (args) => searchRunbook(args as SearchRunbookArgs),
+  search_logs:    (args) => searchLogs(SearchLogsSchema.parse(args)),
+  get_metrics:    (args) => getMetrics(GetMetricsSchema.parse(args)),
+  create_ticket:  (args) => createTicket(CreateTicketSchema.parse(args)),
+  list_services:  (args) => listServices(ListServicesSchema.parse(args)),
+  search_runbook: (args) => searchRunbook(SearchRunbookSchema.parse(args)),
 };
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
   const handler = TOOL_REGISTRY[name];
   if (!handler) throw new Error(`Unknown tool: ${name}`);
-  const result = await handler(args);
-  return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  try {
+    const result = await handler(args);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    if (err instanceof ZodError) {
+      throw new Error(`Invalid arguments for tool ${name}: ${err.issues.map(i => `${i.path.join(".")}: ${i.message}`).join(", ")}`);
+    }
+    throw err;
+  }
 });
 
 // ─── search_logs ─────────────────────────────────────────────────────────────
