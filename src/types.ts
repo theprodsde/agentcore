@@ -25,8 +25,8 @@ export interface Checkpoint {
   step_name: string;
   step_status: "pending" | "running" | "success" | "failed";
   duration_ms: number;
-  input_data: any;
-  output_data: any;
+  input_data:  Record<string, unknown> | null;
+  output_data: Record<string, unknown> | null;
   error_info: string | null;
   created_at: string;
 }

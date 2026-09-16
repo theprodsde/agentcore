@@ -1,4 +1,4 @@
-import { WebClient } from '@slack/web-api';
+import { WebClient, type KnownBlock } from '@slack/web-api';
 import { logger } from './logger.js';
 
 let slackClient: WebClient | null = null;
@@ -15,7 +15,7 @@ export function getSlackClient() {
   return slackClient;
 }
 
-export async function sendSlackResponse(channel: string, thread_ts: string | undefined, blocks: any[], text: string) {
+export async function sendSlackResponse(channel: string, thread_ts: string | undefined, blocks: KnownBlock[], text: string) {
   const client = getSlackClient();
   if (!client) {
     logger.info({ channel, thread_ts, blocks, text }, "Mock Slack message sent. (To enable real Slack, provide SLACK_BOT_TOKEN)");

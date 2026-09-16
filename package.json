@@ -18,7 +18,6 @@
     "db:studio": "drizzle-kit studio"
   },
   "dependencies": {
-    "@google/genai": "^2.8.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/exporter-trace-otlp-http": "^0.222.0",

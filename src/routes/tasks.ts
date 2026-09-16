@@ -31,13 +31,28 @@ tasksRouter.post("/tasks", async (req, res) => {
         .orderBy(desc(tasks.created_at))
         .limit(20);
 
-      // Pre-compute goal word set once — not inside the loop (E-2 DP memoization fix)
+      // Pre-compute goal word set once — not inside the loop (E-2 memoization fix)
       const goalWords = new Set<string>(goal.toLowerCase().split(/\W+/).filter(w => w.length > 3));
 
+      // Request-scoped pair cache — if the same (goal, candidate) pair is evaluated
+      // multiple times (e.g., rapid retries), the DP similarity is not recomputed.
+      // Keys are sorted so (a,b) and (b,a) share the same entry.
+      const pairMemo = new Map<string, number>();
+
       for (const t of recentActive) {
-        const tWords = new Set(t.goal.toLowerCase().split(/\W+/).filter(w => w.length > 3));
-        // Combined: 70% Jaccard word-overlap + 30% Levenshtein edit distance
-        const similarity = jaccardSimilarity(goalWords, tWords) * 0.7 + editSimilarity(goal, t.goal) * 0.3;
+        const memoKey = [goal, t.goal].sort().join("\x00");
+        let similarity = pairMemo.get(memoKey);
+
+        if (similarity === undefined) {
+          const tWords = new Set<string>(t.goal.toLowerCase().split(/\W+/).filter(w => w.length > 3));
+          // Three-way blend matching incidentSimilarity() (55% Jaccard + 25% bounded edit + 20% LCS)
+          // Inlined here so we reuse the pre-computed goalWords set
+          const { lcsSimilarity, boundedEditSimilarity } = await import("../utils/algorithms.js");
+          similarity = jaccardSimilarity(goalWords, tWords) * 0.55
+            + boundedEditSimilarity(goal, t.goal) * 0.25
+            + lcsSimilarity(goal, t.goal) * 0.20;
+          pairMemo.set(memoKey, similarity);
+        }
         if (similarity >= 0.6) {
           return res.status(200).json({
             task_id: t.task_id,

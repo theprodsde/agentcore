@@ -104,6 +104,83 @@ export function topK<T>(items: T[], k: number, score: (item: T) => number): T[] 
   return heap.sort((a, b) => score(b) - score(a));
 }
 
+// ─── 0/1 Knapsack — optimal tool selection ───────────────────────────────────
+
+export interface ToolOption {
+  name: string;
+  avgDurationMs: number; // historical average runtime from the checkpoints table
+  value: number;         // utility score 0–1 (higher = more diagnostically useful)
+  args: Record<string, unknown>;
+}
+
+/**
+ * Selects the optimal subset of MCP tools to maximise total diagnostic value
+ * while staying within `budgetMs` of total execution time.
+ *
+ * This is the classic 0/1 Knapsack problem:
+ *   Maximise  Σ value[i] × x[i]
+ *   Subject to Σ cost[i] × x[i] ≤ B,  x[i] ∈ {0,1}
+ *
+ * DP recurrence (rolling single row):
+ *   dp[j] = max(dp[j], dp[j - cost[i]] + value[i])   for j = B…cost[i]
+ *
+ * Time:  O(n × B/UNIT)
+ * Space: O(B/UNIT) — rolling array, not the full n×B table
+ *
+ * @param tools      Candidate tools with duration estimates and utility scores
+ * @param budgetMs   Maximum allowed total wall-clock time in milliseconds
+ * @returns          Optimal subset in the order they should be executed
+ */
+export function selectOptimalTools(tools: ToolOption[], budgetMs: number): ToolOption[] {
+  if (tools.length === 0 || budgetMs <= 0) return [];
+
+  // Discretise time into 100 ms buckets — keeps table small, precision sufficient
+  const UNIT = 100;
+  const B    = Math.floor(budgetMs / UNIT);
+  const n    = tools.length;
+  const costs = tools.map(t => Math.max(1, Math.ceil(t.avgDurationMs / UNIT)));
+
+  // Scale values to integers — avoids floating-point drift in comparisons
+  const SCALE  = 100_000;
+  const values = tools.map(t => Math.round(Math.max(0, t.value) * SCALE));
+
+  // Full n×(B+1) DP table for correct backtracking.
+  // dp[i][j] = max value using items 0..(i-1) with budget j.
+  // Space: n × (B+1) × 4 bytes = ~40 KB for n=10, B=1000 — acceptable.
+  //
+  // A rolling single-row approach produces the right optimal value but
+  // backtracking through it fails: dp[j - cost[i]] reflects the value
+  // AFTER all items were processed, not just items 0..(i-1), so items
+  // already committed in later backtracking steps pollute earlier checks.
+  const table: Int32Array[] = Array.from({ length: n + 1 }, () => new Int32Array(B + 1));
+
+  for (let i = 1; i <= n; i++) {
+    const c = costs[i - 1];
+    const v = values[i - 1];
+    for (let j = 0; j <= B; j++) {
+      // Exclude item (i-1)
+      table[i][j] = table[i - 1][j];
+      // Include item (i-1) if it fits and improves the value
+      if (j >= c) {
+        const withItem = table[i - 1][j - c] + v;
+        if (withItem > table[i][j]) table[i][j] = withItem;
+      }
+    }
+  }
+
+  // Backtrack: item (i-1) was selected iff table[i][j] != table[i-1][j]
+  const selected: ToolOption[] = [];
+  let j = B;
+  for (let i = n; i >= 1 && j > 0; i--) {
+    if (table[i][j] !== table[i - 1][j]) {
+      selected.push(tools[i - 1]);
+      j -= costs[i - 1];
+    }
+  }
+
+  return selected.reverse(); // restore original order
+}
+
 // ─── Bounded Levenshtein (early-exit DP) ─────────────────────────────────────
 
 /**

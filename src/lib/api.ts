@@ -49,7 +49,7 @@ export async function createTask(task: {
   task_type?: string;
   inject_failure?: boolean;
   dry_run?: boolean;
-}): Promise<{ task_id: string; status: string; trace_id: string; correlated?: boolean }> {
+}): Promise<{ task_id: string; status: string; trace_id: string; correlated?: boolean; message?: string }> {
   return apiFetch(`${API_BASE}/tasks`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

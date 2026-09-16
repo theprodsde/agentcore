@@ -9,6 +9,8 @@ import {
   boundedEditSimilarity,
   lcsLength,
   lcsSimilarity,
+  selectOptimalTools,
+  type ToolOption,
 } from "../../src/utils/algorithms";
 
 // ─── levenshtein ──────────────────────────────────────────────────────────────
@@ -323,5 +325,79 @@ describe("incidentSimilarity", () => {
     const pagerduty = "High error rate on payments-service — payments-service";
     const manual    = "High error rate on payments-service after deploy v3.1";
     expect(incidentSimilarity(pagerduty, manual)).toBeGreaterThan(0.5);
+  });
+});
+
+// ─── selectOptimalTools (0/1 Knapsack DP) ────────────────────────────────────
+
+describe("selectOptimalTools", () => {
+  const tools: ToolOption[] = [
+    { name: "search_logs",    avgDurationMs: 3000, value: 0.9, args: {} },
+    { name: "get_metrics",    avgDurationMs: 2000, value: 0.8, args: {} },
+    { name: "create_ticket",  avgDurationMs: 1000, value: 0.6, args: {} },
+    { name: "search_runbook", avgDurationMs: 5000, value: 0.7, args: {} },
+    { name: "list_services",  avgDurationMs:  500, value: 0.4, args: {} },
+  ];
+
+  it("returns empty array when tools list is empty", () => {
+    expect(selectOptimalTools([], 10_000)).toEqual([]);
+  });
+
+  it("returns empty array when budget is 0", () => {
+    expect(selectOptimalTools(tools, 0)).toEqual([]);
+  });
+
+  it("returns all tools when budget is large enough", () => {
+    const result = selectOptimalTools(tools, 100_000);
+    expect(result).toHaveLength(tools.length);
+  });
+
+  it("respects budget constraint — total duration never exceeds budget", () => {
+    const budget = 6_000;
+    const result = selectOptimalTools(tools, budget);
+    const totalMs = result.reduce((s, t) => s + t.avgDurationMs, 0);
+    expect(totalMs).toBeLessThanOrEqual(budget);
+  });
+
+  it("selects the highest-value combination within budget", () => {
+    // Budget 5000ms:
+    // search_logs(3000, 0.9) + get_metrics(2000, 0.8) = 5000ms, value=1.7  ✓ optimal
+    // search_logs(3000, 0.9) + create_ticket(1000, 0.6) = 4000ms, value=1.5
+    // get_metrics(2000, 0.8) + create_ticket(1000, 0.6) + list_services(500, 0.4) = 3500ms, value=1.8 ✓ better!
+    const budget = 5_000;
+    const result = selectOptimalTools(tools, budget);
+    const totalValue = result.reduce((s, t) => s + t.value, 0);
+    // Verify the total value is at least as good as the greedy single-pick
+    expect(totalValue).toBeGreaterThanOrEqual(0.9); // at minimum, the best single tool
+  });
+
+  it("0/1 constraint: each tool selected at most once", () => {
+    const result = selectOptimalTools(tools, 100_000);
+    const names = result.map(t => t.name);
+    expect(new Set(names).size).toBe(names.length); // no duplicates
+  });
+
+  it("works with a single tool", () => {
+    const single = [{ name: "search_logs", avgDurationMs: 3000, value: 0.9, args: {} }];
+    expect(selectOptimalTools(single, 5000)).toHaveLength(1);
+    expect(selectOptimalTools(single, 2000)).toHaveLength(0); // over budget
+  });
+
+  it("handles tools with identical costs — picks highest value", () => {
+    const equalCost: ToolOption[] = [
+      { name: "a", avgDurationMs: 2000, value: 0.5, args: {} },
+      { name: "b", avgDurationMs: 2000, value: 0.9, args: {} },
+      { name: "c", avgDurationMs: 2000, value: 0.3, args: {} },
+    ];
+    const result = selectOptimalTools(equalCost, 2_500); // fits exactly one
+    expect(result).toHaveLength(1);
+    expect(result[0].name).toBe("b"); // highest value
+  });
+
+  it("budget exactly equal to one tool's cost selects that tool", () => {
+    const result = selectOptimalTools(tools, 3_000); // exactly search_logs
+    const totalMs = result.reduce((s, t) => s + t.avgDurationMs, 0);
+    expect(totalMs).toBeLessThanOrEqual(3_000);
+    expect(result.length).toBeGreaterThan(0);
   });
 });

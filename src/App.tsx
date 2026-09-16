@@ -1,6 +1,7 @@
 import React from "react";
 import { BrowserRouter as Router, Routes, Route, Link, useLocation } from "react-router-dom";
 import { Activity, LayoutDashboard, PlusCircle, Brain, PlaySquare, BarChart2 } from "lucide-react";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { cn } from "./lib/utils";
 import Dashboard from "./pages/Dashboard";
 import NewTask from "./pages/NewTask";
@@ -30,14 +31,16 @@ export default function App() {
         </aside>
 
         <main className="flex-1 overflow-auto bg-[#FAFAFA]">
-          <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/tasks/new" element={<NewTask />} />
-            <Route path="/tasks/:taskId" element={<TaskDetail />} />
-            <Route path="/memory" element={<MemoryExplorer />} />
-            <Route path="/metrics" element={<MetricsDashboard />} />
-            <Route path="/demo" element={<DemoScenarios />} />
-          </Routes>
+          <ErrorBoundary>
+            <Routes>
+              <Route path="/" element={<Dashboard />} />
+              <Route path="/tasks/new" element={<NewTask />} />
+              <Route path="/tasks/:taskId" element={<TaskDetail />} />
+              <Route path="/memory" element={<MemoryExplorer />} />
+              <Route path="/metrics" element={<MetricsDashboard />} />
+              <Route path="/demo" element={<DemoScenarios />} />
+            </Routes>
+          </ErrorBoundary>
         </main>
       </div>
     </Router>

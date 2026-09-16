@@ -10,7 +10,7 @@ import { tracer, SpanStatusCode } from "./telemetry";
 import { parseLLMJson, toErrorMessage } from "../utils/index";
 import { deriveSynthesisFromOutput, type SynthOutput } from "../utils/synthesis";
 import { getCached, setCached, toolCacheKey } from "./cache";
-import { topK } from "../utils/algorithms";
+import { topK, selectOptimalTools, type ToolOption } from "../utils/algorithms";
 export { deriveSynthesisFromOutput } from "../utils/synthesis";
 
 export const taskEventEmitter = new EventEmitter();
@@ -185,6 +185,52 @@ export async function plannerHandler(
   };
 }
 
+/**
+ * Queries historical avg duration per tool name from the checkpoints table,
+ * then uses 0/1 Knapsack DP to select the optimal subset within budgetMs.
+ * Falls back to the full list when no history exists (first run).
+ */
+async function pruneToolsWithKnapsack(
+  toolCalls: ToolCall[],
+  budgetMs: number
+): Promise<ToolCall[]> {
+  if (toolCalls.length === 0) return toolCalls;
+
+  try {
+    // Load historical avg duration per tool from the checkpoints table
+    const stats = await db.select({
+      step_name: checkpoints.step_name,
+      avg_ms:    sql<number>`AVG(duration_ms)`,
+    })
+      .from(checkpoints)
+      .where(and(eq(checkpoints.step_status, "success"), sql`step_name LIKE 'tool_%'`))
+      .groupBy(checkpoints.step_name);
+
+    const durMap = new Map(stats.map(s => [s.step_name.replace("tool_", ""), Math.round(Number(s.avg_ms))]));
+
+    const options: ToolOption[] = toolCalls.map(call => ({
+      name: call.tool,
+      args: call.args,
+      // Default to 2 000 ms if no history; tools without history are assumed cheap
+      avgDurationMs: durMap.get(call.tool) ?? 2_000,
+      // All tools are treated as equally valuable by default — the LLM chose them
+      value: 1,
+    }));
+
+    const totalEstimate = options.reduce((s, t) => s + t.avgDurationMs, 0);
+    if (totalEstimate <= budgetMs) return toolCalls; // all fit — skip DP
+
+    const selected = selectOptimalTools(options, budgetMs);
+    const selectedNames = new Set(selected.map(t => t.name));
+    logger.info({ budget_ms: budgetMs, total_ms: totalEstimate, kept: selected.map(t => t.name) }, "Knapsack pruned tool set");
+
+    return toolCalls.filter(c => selectedNames.has(c.tool));
+  } catch {
+    // Non-fatal: fall back to the full tool list on any error
+    return toolCalls;
+  }
+}
+
 export async function executionHandler(
   planContext: PlanContext,
   goal: string,
@@ -194,9 +240,14 @@ export async function executionHandler(
   const toolCalls = planContext.tool_calls;
 
   if (mcpClient && !injectFailure && Array.isArray(toolCalls) && toolCalls.length > 0) {
+    // 0/1 Knapsack: prune tool set to fit within budget using historical avg durations
+    // Avoids blowing the step SLO when the planner selects many expensive tools.
+    const STEP_BUDGET_MS = Number(process.env.TOOL_BUDGET_MS ?? 15_000);
+    const prunedCalls = await pruneToolsWithKnapsack(toolCalls, STEP_BUDGET_MS);
+
     // Run all tools in parallel — independent calls, no reason to serialize
     const entries = await Promise.all(
-      toolCalls.map(async ({ tool, args }) => {
+      prunedCalls.map(async ({ tool, args }) => {
         const key = toolCacheKey(tool, args);
         const cached = getCached(key);
         if (cached) {
