@@ -80,6 +80,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: "search_runbook",
+      description: "Search internal runbooks for procedures matching this incident type. Returns relevant runbook excerpts and recommended steps.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Incident description or error pattern to search for" },
+          service: { type: "string", description: "Service name to narrow runbook search" },
+        },
+        required: ["query"],
+      },
+    },
   ],
 }));
 
@@ -87,10 +99,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 // Tool registry — add new tools here without touching the dispatch loop
 const TOOL_REGISTRY: Record<string, (args: unknown) => Promise<unknown>> = {
-  search_logs:   (args) => searchLogs(args as SearchLogsArgs),
-  get_metrics:   (args) => getMetrics(args as GetMetricsArgs),
-  create_ticket: (args) => createTicket(args as CreateTicketArgs),
-  list_services: (args) => listServices(args as ListServicesArgs),
+  search_logs:    (args) => searchLogs(args as SearchLogsArgs),
+  get_metrics:    (args) => getMetrics(args as GetMetricsArgs),
+  create_ticket:  (args) => createTicket(args as CreateTicketArgs),
+  list_services:  (args) => listServices(args as ListServicesArgs),
+  search_runbook: (args) => searchRunbook(args as SearchRunbookArgs),
 };
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -354,6 +367,94 @@ async function listServices(args: ListServicesArgs) {
     services: filtered,
     checked_at: new Date().toISOString(),
   };
+}
+
+// ─── search_runbook ───────────────────────────────────────────────────────────
+
+interface SearchRunbookArgs {
+  query: string;
+  service?: string;
+}
+
+async function searchRunbook(args: SearchRunbookArgs) {
+  const { query, service } = args;
+
+  if (process.env.RUNBOOK_URL) {
+    try {
+      const resp = await fetch(`${process.env.RUNBOOK_URL}/search?q=${encodeURIComponent(query)}&service=${encodeURIComponent(service ?? "")}`);
+      if (resp.ok) {
+        const data = await resp.json() as { results: unknown[] };
+        return { backend: "runbook_api", query, results: data.results };
+      }
+    } catch { /* fall through to simulation */ }
+  }
+
+  // Simulation: return contextual runbook entries based on query keywords
+  const q = query.toLowerCase();
+  const isDeadlock  = q.includes("deadlock") || q.includes("lock");
+  const isOom       = q.includes("oom") || q.includes("memory") || q.includes("heap");
+  const isLatency   = q.includes("latency") || q.includes("slow") || q.includes("p99");
+  const isCpu       = q.includes("cpu") || q.includes("throttl");
+  const svc         = service ?? "your-service";
+
+  const runbooks: { title: string; url: string; steps: string[] }[] = [];
+
+  if (isDeadlock) runbooks.push({
+    title: `DB Deadlock Runbook — ${svc}`,
+    url: "#runbook/db-deadlock",
+    steps: [
+      "Check active transactions: `SELECT * FROM pg_locks JOIN pg_stat_activity USING (pid) WHERE NOT granted;`",
+      "Kill blocking queries: `SELECT pg_cancel_backend(<pid>);`",
+      "Increase `lock_timeout` to fail fast rather than wait indefinitely",
+      "Review slow query log for missing indexes causing full-table scans",
+    ],
+  });
+
+  if (isOom) runbooks.push({
+    title: `Memory Leak / OOM Runbook — ${svc}`,
+    url: "#runbook/oom-response",
+    steps: [
+      "Cordon the affected pod: `kubectl cordon <node>`",
+      "Capture heap dump before restart: `kubectl exec <pod> -- node --prof`",
+      "Drain and restart: `kubectl rollout restart deployment/${svc}`",
+      "Set memory limits if not already configured in the Deployment spec",
+      "Check for event-listener leaks using `process.listenerCount('data')`",
+    ],
+  });
+
+  if (isLatency) runbooks.push({
+    title: `High Latency Runbook — ${svc}`,
+    url: "#runbook/latency",
+    steps: [
+      "Check downstream dependencies with `GET /api/health/detailed`",
+      "Review circuit-breaker state — open breakers cause immediate fallback latency",
+      "Query slow-query log: `SELECT query, mean_exec_time FROM pg_stat_statements ORDER BY mean_exec_time DESC LIMIT 10;`",
+      "Scale horizontal replicas if CPU > 80%: `kubectl scale deployment/${svc} --replicas=N`",
+    ],
+  });
+
+  if (isCpu) runbooks.push({
+    title: `CPU Saturation Runbook — ${svc}`,
+    url: "#runbook/cpu-saturation",
+    steps: [
+      "Identify hot function: attach profiler `clinic flame -- node server.js`",
+      "Check for synchronous operations blocking the event loop",
+      "Review recent deploys for N+1 query patterns or tight loops",
+      "Horizontal scale immediately to restore SLO, then investigate root cause",
+    ],
+  });
+
+  if (runbooks.length === 0) runbooks.push({
+    title: `General Incident Response — ${svc}`,
+    url: "#runbook/general",
+    steps: [
+      "Check service health endpoint and compare against last known-good baseline",
+      "Review recent deploys (last 2h) for correlation",
+      "Escalate to service owner if issue persists > 15 minutes",
+    ],
+  });
+
+  return { backend: "simulation", query, service: svc, results: runbooks };
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────

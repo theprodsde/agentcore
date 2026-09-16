@@ -36,9 +36,11 @@ export const tasks = pgTable("tasks", {
   final_output:   text("final_output"),
   error:          text("error"),
   trace_id:       text("trace_id").notNull(),
-  inject_failure: boolean("inject_failure").notNull().default(false),
-  created_at:     timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updated_at:     timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  inject_failure:      boolean("inject_failure").notNull().default(false),
+  dry_run:             boolean("dry_run").notNull().default(false),
+  correlated_task_id:  uuid("correlated_task_id"),
+  created_at:          timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updated_at:          timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
 export const checkpoints = pgTable("checkpoints", {

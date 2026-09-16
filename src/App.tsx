@@ -1,12 +1,13 @@
 import React from "react";
 import { BrowserRouter as Router, Routes, Route, Link, useLocation } from "react-router-dom";
-import { Activity, LayoutDashboard, PlusCircle, Brain, PlaySquare } from "lucide-react";
+import { Activity, LayoutDashboard, PlusCircle, Brain, PlaySquare, BarChart2 } from "lucide-react";
 import { cn } from "./lib/utils";
 import Dashboard from "./pages/Dashboard";
 import NewTask from "./pages/NewTask";
 import TaskDetail from "./pages/TaskDetail";
 import MemoryExplorer from "./pages/MemoryExplorer";
 import DemoScenarios from "./pages/DemoScenarios";
+import MetricsDashboard from "./pages/MetricsDashboard";
 
 export default function App() {
   return (
@@ -21,7 +22,8 @@ export default function App() {
           <nav className="w-full p-4 flex flex-col gap-1 flex-1">
             <NavItem to="/" icon={<LayoutDashboard size={18} />} label="Dashboard" />
             <NavItem to="/tasks/new" icon={<PlusCircle size={18} />} label="New Task" />
-            <NavItem to="/memory" icon={<Brain size={18} />} label="Memory" />
+            <NavItem to="/memory"  icon={<Brain size={18} />}     label="Memory" />
+            <NavItem to="/metrics" icon={<BarChart2 size={18} />}  label="Metrics" />
             <div className="mt-8 mb-2 px-2 text-xs font-semibold text-slate-400 uppercase tracking-wider">Playground</div>
             <NavItem to="/demo" icon={<PlaySquare size={18} />} label="Scenarios" />
           </nav>
@@ -33,6 +35,7 @@ export default function App() {
             <Route path="/tasks/new" element={<NewTask />} />
             <Route path="/tasks/:taskId" element={<TaskDetail />} />
             <Route path="/memory" element={<MemoryExplorer />} />
+            <Route path="/metrics" element={<MetricsDashboard />} />
             <Route path="/demo" element={<DemoScenarios />} />
           </Routes>
         </main>

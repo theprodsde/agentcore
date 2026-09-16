@@ -33,9 +33,35 @@ export default function TaskDetail() {
   };
 
   useEffect(() => {
-    loadData();
-    const interval = setInterval(loadData, 2000);
-    return () => clearInterval(interval);
+    loadData(); // always load current state on mount
+
+    // Connect to SSE stream for live updates while task is active
+    let es: EventSource | null = null;
+
+    const connectStream = () => {
+      es = new EventSource(`/api/tasks/${taskId}/stream`);
+
+      es.onmessage = (e) => {
+        try {
+          const event = JSON.parse(e.data);
+          // Any event means state changed — reload full task + checkpoints
+          loadData();
+          // Disconnect once terminal state reached
+          if (event.status === "completed" || event.status === "failed") {
+            es?.close();
+          }
+        } catch { /* ignore malformed */ }
+      };
+
+      es.onerror = () => {
+        es?.close();
+        // Fallback to polling if SSE fails (e.g. proxy drops the connection)
+        setTimeout(loadData, 2000);
+      };
+    };
+
+    connectStream();
+    return () => es?.close();
   }, [taskId]);
 
   const handleResume = async () => {

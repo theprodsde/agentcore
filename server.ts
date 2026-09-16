@@ -40,10 +40,12 @@ import { getLLMClient, LLM_MODELS } from "./src/server/llm.js";
 import { authMiddleware, isAuthEnabled } from "./src/server/auth.js";
 import { parseLLMJson, generateTraceId, toErrorMessage } from "./src/utils/index.js";
 
-import { healthRouter } from "./src/routes/health.js";
-import { authRouter }   from "./src/routes/auth.js";
-import { tasksRouter }  from "./src/routes/tasks.js";
-import { memoryRouter } from "./src/routes/memory.js";
+import { healthRouter }   from "./src/routes/health.js";
+import { authRouter }     from "./src/routes/auth.js";
+import { tasksRouter }    from "./src/routes/tasks.js";
+import { memoryRouter }   from "./src/routes/memory.js";
+import { webhooksRouter } from "./src/routes/webhooks.js";
+import { metricsRouter }  from "./src/routes/metrics.js";
 
 // ─── Public routes (no auth) ──────────────────────────────────────────────────
 
@@ -151,6 +153,9 @@ app.post("/api/simulate", async (req, res) => {
   }
 });
 
+// Webhooks are public — no JWT required (they use their own signing verification)
+app.use("/api", webhooksRouter);
+
 app.use("/api", authRouter);
 
 // Apply JWT auth to all remaining /api routes
@@ -159,6 +164,7 @@ app.use("/api", authMiddleware);
 app.use("/api", healthRouter);
 app.use("/api", tasksRouter);
 app.use("/api", memoryRouter);
+app.use("/api", metricsRouter);
 
 // ─── Frontend ─────────────────────────────────────────────────────────────────
 
