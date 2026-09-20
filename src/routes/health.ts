@@ -3,6 +3,7 @@ import { sql } from "drizzle-orm";
 import { db } from "../server/db/index.js";
 import { getLLMClient } from "../server/llm.js";
 import { listMcpTools } from "../server/mcp.js";
+import { asyncHandler } from "../server/http.js";
 import { toErrorMessage } from "../utils/index.js";
 
 export const healthRouter = Router();
@@ -11,7 +12,7 @@ healthRouter.get("/health", (_req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-healthRouter.get("/health/detailed", async (_req, res) => {
+healthRouter.get("/health/detailed", asyncHandler(async (_req, res) => {
   // Run independent subsystem checks in parallel — O(max latency) vs O(sum of latencies)
   const [dbCheck, mcpCheck] = await Promise.allSettled([
     (async () => {
@@ -38,4 +39,4 @@ healthRouter.get("/health/detailed", async (_req, res) => {
 
   const allOk = Object.values(checks).every((c) => (c as { status: string }).status !== "error");
   return res.status(allOk ? 200 : 503).json({ status: allOk ? "ok" : "degraded", timestamp: new Date().toISOString(), checks });
-});
+}));

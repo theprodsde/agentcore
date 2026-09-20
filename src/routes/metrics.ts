@@ -2,12 +2,13 @@ import { Router } from "express";
 import { eq, sql, gte, and } from "drizzle-orm";
 import { db, tasks, checkpoints } from "../server/db/index.js";
 import { getCached, setCached } from "../server/cache.js";
+import { asyncHandler } from "../server/http.js";
 
 export const metricsRouter = Router();
 
 const METRICS_TTL_MS = 60 * 1000; // 60 s — data changes at most once per task completion
 
-metricsRouter.get("/metrics", async (req, res) => {
+metricsRouter.get("/metrics", asyncHandler(async (req, res) => {
   const cacheKey = `metrics:${req.teamId ?? "global"}`;
   const cached = getCached(cacheKey);
   if (cached) return res.json(cached);
@@ -88,4 +89,4 @@ metricsRouter.get("/metrics", async (req, res) => {
   // Cache the result — metrics change only when a task completes (every few minutes)
   setCached(cacheKey, response, METRICS_TTL_MS);
   return res.json(response);
-});
+}));

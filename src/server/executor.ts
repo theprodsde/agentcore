@@ -1,6 +1,6 @@
 import { EventEmitter } from "events";
 import crypto from "crypto";
-import { eq, and, inArray, sql, desc } from "drizzle-orm";
+import { eq, and, gte, inArray, sql, desc } from "drizzle-orm";
 import { db, tasks, checkpoints, memories } from "./db/index";
 import { logger } from "./logger";
 import { getMcpClient, executeMcpTool, getMcpToolSummary } from "./mcp";
@@ -108,15 +108,19 @@ async function executeStep(
 
 // ─── Step handlers ─────────────────────────────────────────────────────────────
 
-export async function memoryRetrievalHandler(goal: string): Promise<Record<string, unknown>> {
+export async function memoryRetrievalHandler(goal: string, teamId: string | null = null): Promise<Record<string, unknown>> {
   const queryEmbedding = await embed(goal);
   let related: typeof memories.$inferSelect[] = [];
+
+  // Memories are strictly team-scoped: a team's incidents must never surface in
+  // another team's LLM context. Tasks without a team only see team-less memories.
+  const teamFilter = sql`${memories.team_id} IS NOT DISTINCT FROM ${teamId}`;
 
   if (queryEmbedding) {
     // Fetch top 20 by cosine similarity, then re-rank with time-decay weighting
     // using top-k selection (O(n·log k)) instead of full sort (O(n log n))
     const candidates = await db.select().from(memories)
-      .where(sql`${memories.embedding} IS NOT NULL`)
+      .where(sql`${memories.embedding} IS NOT NULL AND ${teamFilter}`)
       .orderBy(sql`${memories.embedding} <=> ${JSON.stringify(queryEmbedding)}::vector`)
       .limit(20);
 
@@ -130,7 +134,7 @@ export async function memoryRetrievalHandler(goal: string): Promise<Record<strin
 
     related = topK(scored, 3, (m) => m._effective_score);
   } else {
-    related = await db.select().from(memories).orderBy(desc(memories.created_at)).limit(3);
+    related = await db.select().from(memories).where(teamFilter).orderBy(desc(memories.created_at)).limit(3);
   }
 
   return {
@@ -231,32 +235,58 @@ async function pruneToolsWithKnapsack(
   }
 }
 
+// Tools with external side effects must never be served from cache (a "cached"
+// ticket means no ticket was created) and must be skipped entirely on dry runs.
+const SIDE_EFFECT_TOOLS = new Set(["create_ticket"]);
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); }
+    );
+  });
+}
+
 export async function executionHandler(
   planContext: PlanContext,
   goal: string,
-  injectFailure: boolean
+  injectFailure: boolean,
+  dryRun = false
 ): Promise<Record<string, unknown>> {
   const mcpClient = await getMcpClient();
-  const toolCalls = planContext.tool_calls;
+  let toolCalls = planContext.tool_calls;
+
+  // Enforce dry-run at the execution boundary — the planner prompt asks the LLM
+  // to omit side-effect tools, but prompts are not guarantees.
+  if (dryRun && Array.isArray(toolCalls)) {
+    toolCalls = toolCalls.filter((c) => !SIDE_EFFECT_TOOLS.has(c.tool));
+  }
 
   if (mcpClient && !injectFailure && Array.isArray(toolCalls) && toolCalls.length > 0) {
     // 0/1 Knapsack: prune tool set to fit within budget using historical avg durations
     // Avoids blowing the step SLO when the planner selects many expensive tools.
     const STEP_BUDGET_MS = Number(process.env.TOOL_BUDGET_MS ?? 15_000);
+    // Hard wall-clock cap per tool call — a hung backend must not stall the step forever
+    const CALL_TIMEOUT_MS = Number(process.env.TOOL_CALL_TIMEOUT_MS ?? 10_000);
     const prunedCalls = await pruneToolsWithKnapsack(toolCalls, STEP_BUDGET_MS);
 
     // Run all tools in parallel — independent calls, no reason to serialize
     const entries = await Promise.all(
       prunedCalls.map(async ({ tool, args }) => {
+        const cacheable = !SIDE_EFFECT_TOOLS.has(tool);
         const key = toolCacheKey(tool, args);
-        const cached = getCached(key);
-        if (cached) {
-          logger.info({ tool }, "Tool result served from cache");
-          return [`tool_${tool}`, cached] as const;
+        if (cacheable) {
+          const cached = getCached(key);
+          if (cached) {
+            logger.info({ tool }, "Tool result served from cache");
+            return [`tool_${tool}`, cached] as const;
+          }
         }
         try {
-          const result = await executeMcpTool(tool, args);
-          setCached(key, result);
+          const result = await withTimeout(executeMcpTool(tool, args), CALL_TIMEOUT_MS, `tool ${tool}`);
+          if (cacheable) setCached(key, result);
           return [`tool_${tool}`, result] as const;
         } catch (e: unknown) {
           logger.error({ err: e, tool }, "MCP tool execution failed");
@@ -269,10 +299,10 @@ export async function executionHandler(
 
   // Fallback: service-aware stubs when MCP unavailable
   await sleep(1500);
-  const service = planContext.tool_calls?.[0]?.args?.service as string ?? "unknown-service";
+  const service = toolCalls?.[0]?.args?.service as string ?? "unknown-service";
   const results: Record<string, unknown> = {};
 
-  for (const call of planContext.tool_calls ?? []) {
+  for (const call of toolCalls ?? []) {
     results[`tool_${call.tool}`] = buildFallbackToolResult(call.tool, call.args, service);
   }
 
@@ -373,7 +403,7 @@ export async function runTaskOrchestrator(taskId: string) {
       const memoryContext = completedSteps.has(1)
         ? (doneMap.get(1)?.output_data ?? {})
         : await executeStep(taskId, 1, "memory_retrieval", { goal: task.goal },
-            () => memoryRetrievalHandler(task.goal), task);
+            () => memoryRetrievalHandler(task.goal, task.team_id), task);
 
       const planContext = completedSteps.has(2)
         ? (doneMap.get(2)?.output_data ?? {}) as PlanContext
@@ -383,7 +413,7 @@ export async function runTaskOrchestrator(taskId: string) {
       const executionOutput = completedSteps.has(3)
         ? (doneMap.get(3)?.output_data ?? {}) as Record<string, unknown>
         : await executeStep(taskId, 3, "execution", { planContext },
-            () => executionHandler(planContext, task.goal, task.inject_failure), task) as Record<string, unknown>;
+            () => executionHandler(planContext, task.goal, task.inject_failure, task.dry_run), task) as Record<string, unknown>;
 
       const synthOutput = completedSteps.has(4)
         ? (doneMap.get(4)?.output_data ?? {}) as SynthOutput
@@ -430,7 +460,12 @@ export async function runTaskOrchestrator(taskId: string) {
 }
 
 export async function recoverStaleTasks() {
-  const stale = await db.select().from(tasks).where(inArray(tasks.status, ["running", "pending"]));
+  // Only resume tasks touched in the last 24h — restarting after a long outage
+  // must not stampede-rerun weeks of abandoned tasks (and their LLM calls).
+  const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const stale = await db.select().from(tasks).where(
+    and(inArray(tasks.status, ["running", "pending"]), gte(tasks.updated_at, dayAgo))
+  );
   if (stale.length === 0) return;
   logger.info({ count: stale.length }, "Recovering stale tasks from previous run");
 

@@ -1,18 +1,26 @@
 import { Router } from "express";
-import { eq, ne, desc, sql } from "drizzle-orm";
+import { eq, ne, and, desc, sql } from "drizzle-orm";
 import { db, memories } from "../server/db/index.js";
 import { embed } from "../server/embeddings.js";
+import { asyncHandler } from "../server/http.js";
 import { topK } from "../utils/algorithms.js";
 
 export const memoryRouter = Router();
 
-memoryRouter.get("/tasks/:task_id/memory", async (req, res) => {
+memoryRouter.get("/tasks/:task_id/memory", asyncHandler(async (req, res) => {
   const { task_id } = req.params;
-  const related = await db.select().from(memories).where(ne(memories.task_id, task_id)).limit(5);
+  // Scope to the caller's team — related memories must not cross tenant boundaries
+  const related = await db.select().from(memories)
+    .where(and(
+      ne(memories.task_id, task_id),
+      sql`${memories.team_id} IS NOT DISTINCT FROM ${req.teamId ?? null}`
+    ))
+    .orderBy(desc(memories.created_at))
+    .limit(5);
   return res.json({ task_id, related_memories: related });
-});
+}));
 
-memoryRouter.get("/memory", async (req, res) => {
+memoryRouter.get("/memory", asyncHandler(async (req, res) => {
   const pageSize = Math.min(Math.max(1, Number(req.query.limit) || 50), 200);
   const offset   = Math.max(0, Number(req.query.offset) || 0);
 
@@ -23,9 +31,9 @@ memoryRouter.get("/memory", async (req, res) => {
         .orderBy(desc(memories.created_at)).limit(pageSize).offset(offset);
 
   return res.json({ items: rows, limit: pageSize, offset });
-});
+}));
 
-memoryRouter.post("/memory/query", async (req, res) => {
+memoryRouter.post("/memory/query", asyncHandler(async (req, res) => {
   const { query } = req.body;
   const limit = Math.min(Math.max(1, Number(req.body.limit) || 5), 50); // clamp 1–50
   if (!query) return res.status(400).json({ error: "query is required" });
@@ -71,4 +79,4 @@ memoryRouter.post("/memory/query", async (req, res) => {
   } catch (err) {
     return res.status(500).json({ error: "Memory query failed", details: err instanceof Error ? err.message : String(err) });
   }
-});
+}));

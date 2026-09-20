@@ -1,6 +1,6 @@
 # Production Deployment Guide
 
-AgentCore is production-ready. This document covers what's wired up, what requires your credentials, and how to operate it in a real environment.
+This document covers what's wired up, what requires your credentials, how to operate AgentCore in a real environment — and, just as importantly, the known limits you should design around.
 
 ---
 
@@ -30,7 +30,20 @@ cp .env.example .env   # fill in DATABASE_URL + OPENAI_API_KEY + JWT_SECRET
 docker-compose up --build
 ```
 
-This boots pgvector Postgres, Jaeger, and the app. The app runs `drizzle-kit push` before starting and then calls `recoverStaleTasks()` to resume any in-flight tasks from a previous run.
+This boots pgvector Postgres, Jaeger, and the app. On startup the app applies versioned migrations (`node scripts/migrate.mjs`, using drizzle-orm's bundled migrator — no drizzle-kit or registry access needed in the image) and then calls `recoverStaleTasks()` to resume tasks that were in flight during the previous 24 hours.
+
+---
+
+## Security checklist before going live
+
+| Setting | Why |
+|---|---|
+| `JWT_SECRET` | Without it, **every API endpoint is open** — anyone can read tasks, memories, and create investigations |
+| `SLACK_SIGNING_SECRET` | Without it, anyone who discovers the URL can forge Slack events and trigger LLM-backed investigations (token cost + data exposure) |
+| Webhook secrets (`PAGERDUTY_WEBHOOK_SECRET`, `OPSGENIE_WEBHOOK_SECRET`, `ALERTMANAGER_SECRET`) | Webhook endpoints are public by design; unsigned = anyone can create tasks |
+| Reverse proxy with TLS + rate limiting | AgentCore does not terminate TLS or rate-limit; put nginx/Caddy/an ALB in front |
+
+Signature verification is performed against the **raw request bytes** (captured before JSON parsing), with timing-safe comparison and, for Slack, a 5-minute replay window.
 
 ---
 
@@ -88,6 +101,18 @@ Point your alert source at:
 
 **Connection pool:** tuned to `max: 20, idle_timeout: 30s, connect_timeout: 10s`. Adjust `max` to match your Postgres `max_connections`.
 
+**Tool execution limits:** each MCP tool call is capped by `TOOL_CALL_TIMEOUT_MS` (default 10s) so a hung backend cannot stall a step; the knapsack pruner keeps total estimated tool time under `TOOL_BUDGET_MS`.
+
+---
+
+## Known limitations (design around these)
+
+- **Single-process task queue.** Tasks run in-process via `setImmediate`. If the process dies mid-task, checkpoints preserve progress and `recoverStaleTasks()` resumes on restart — but running two app replicas will double-process recovered tasks. Run one replica, or swap dispatch for BullMQ before scaling out.
+- **SSE task streams are per-process.** With multiple replicas behind a load balancer, a client may connect to a replica that isn't executing its task. Use sticky sessions or single-replica until a shared event bus exists.
+- **No rate limiting or request quotas.** Every accepted task costs LLM tokens. Front with a rate limiter, and set spend limits on your OpenAI key.
+- **Team creation (`POST /api/teams`) is open** so the first team can bootstrap itself. Restrict it at the proxy after initial setup.
+- **Tool result cache and embedding cache are in-memory** — they reset on restart and are not shared across replicas.
+
 ---
 
 ## Operations
@@ -98,7 +123,7 @@ npm run db:migrate    # apply versioned migrations (safe to run on startup)
 npm run db:generate   # generate a new migration after schema changes
 ```
 
-The Docker `CMD` runs `drizzle-kit push` (for simplicity in single-node setups). For production, switch to `drizzle-kit migrate` for reproducible, auditable migrations.
+The Docker `CMD` runs `node scripts/migrate.mjs`, which applies the versioned SQL files in `drizzle/` via drizzle-orm's migrator. It is idempotent — already-applied migrations are skipped.
 
 ### Health checks
 ```

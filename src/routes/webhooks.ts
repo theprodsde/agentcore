@@ -11,18 +11,26 @@ import { logger } from "../server/logger.js";
 
 // ─── Signature verification middleware ───────────────────────────────────────
 
-function verifyHmac(secret: string, payload: string, signature: string, algorithm = "sha256"): boolean {
+function verifyHmac(secret: string, payload: string | Buffer, signature: string, algorithm = "sha256"): boolean {
   const expected = crypto.createHmac(algorithm, secret).update(payload).digest("hex");
   try {
     return crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(signature.replace(/^sha256=/, ""), "hex"));
   } catch { return false; }
 }
 
+// Providers sign the raw request bytes — verifying against JSON.stringify(req.body)
+// fails whenever key order or whitespace differs from the original payload.
+function rawPayload(req: Request): string | Buffer {
+  return req.rawBody ?? JSON.stringify(req.body);
+}
+
 function requirePagerDutySignature(req: Request, res: Response, next: NextFunction) {
   const secret = process.env.PAGERDUTY_WEBHOOK_SECRET;
   if (!secret) return next(); // skip if not configured (development)
   const sig = req.headers["x-pagerduty-signature"] as string | undefined;
-  if (!sig || !verifyHmac(secret, JSON.stringify(req.body), sig)) {
+  // PagerDuty may send multiple comma-separated signatures during key rotation
+  const candidates = (sig ?? "").split(",").map(s => s.trim().replace(/^v1=/, "")).filter(Boolean);
+  if (!candidates.some(c => verifyHmac(secret, rawPayload(req), c))) {
     return res.status(401).json({ error: "Invalid PagerDuty signature" });
   }
   next();
@@ -32,7 +40,7 @@ function requireOpsGenieSignature(req: Request, res: Response, next: NextFunctio
   const secret = process.env.OPSGENIE_WEBHOOK_SECRET;
   if (!secret) return next();
   const sig = req.headers["x-opsgenie-hmac-sha256-signature"] as string | undefined;
-  if (!sig || !verifyHmac(secret, JSON.stringify(req.body), sig)) {
+  if (!sig || !verifyHmac(secret, rawPayload(req), sig)) {
     return res.status(401).json({ error: "Invalid OpsGenie signature" });
   }
   next();
@@ -42,7 +50,10 @@ function requireAlertmanagerSecret(req: Request, res: Response, next: NextFuncti
   const secret = process.env.ALERTMANAGER_SECRET;
   if (!secret) return next();
   const provided = req.headers["x-alertmanager-secret"] as string | undefined;
-  if (provided !== secret) return res.status(401).json({ error: "Invalid Alertmanager secret" });
+  const matches = !!provided
+    && provided.length === secret.length
+    && crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(secret));
+  if (!matches) return res.status(401).json({ error: "Invalid Alertmanager secret" });
   next();
 }
 

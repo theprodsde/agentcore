@@ -2,6 +2,7 @@ import { Router } from "express";
 import { eq } from "drizzle-orm";
 import { db, apiKeys } from "../server/db/index.js";
 import { authMiddleware, isAuthEnabled, createTeam, exchangeApiKey, generateApiKey, hashApiKey } from "../server/auth.js";
+import { asyncHandler } from "../server/http.js";
 import { logger } from "../server/logger.js";
 
 export const authRouter = Router();
@@ -36,11 +37,11 @@ authRouter.post("/auth/token", async (req, res) => {
   }
 });
 
-authRouter.post("/teams/:team_id/api-keys", authMiddleware, async (req, res) => {
+authRouter.post("/teams/:team_id/api-keys", authMiddleware, asyncHandler(async (req, res) => {
   const { team_id } = req.params;
   if (req.teamId && req.teamId !== team_id) return res.status(403).json({ error: "Forbidden" });
   const { description } = req.body;
   const raw = generateApiKey();
   await db.insert(apiKeys).values({ team_id, key_hash: hashApiKey(raw), description: description || null });
   return res.status(201).json({ api_key: raw, note: "Save this API key — it will not be shown again." });
-});
+}));

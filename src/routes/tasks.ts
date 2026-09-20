@@ -1,8 +1,9 @@
-import { Router } from "express";
+import { Router, type Response } from "express";
 import { eq, desc, and, gte, sql } from "drizzle-orm";
 import { db, tasks, checkpoints } from "../server/db/index.js";
 import { runTaskOrchestrator, taskEventEmitter } from "../server/executor.js";
 import { getLLMClient } from "../server/llm.js";
+import { asyncHandler } from "../server/http.js";
 import { generateTraceId } from "../utils/index.js";
 import { jaccardSimilarity, editSimilarity } from "../utils/algorithms.js";
 
@@ -10,7 +11,7 @@ export const tasksRouter = Router();
 
 // ─── Task creation with deduplication ─────────────────────────────────────────
 
-tasksRouter.post("/tasks", async (req, res) => {
+tasksRouter.post("/tasks", asyncHandler(async (req, res) => {
   const { goal, context, task_type, user_id, inject_failure, dry_run } = req.body;
   if (!goal) return res.status(400).json({ error: "Missing goal" });
 
@@ -25,7 +26,9 @@ tasksRouter.post("/tasks", async (req, res) => {
         .where(
           and(
             gte(tasks.created_at, tenMinsAgo),
-            sql`${tasks.status} IN ('pending','running')`
+            sql`${tasks.status} IN ('pending','running')`,
+            // Never correlate across teams — dedup must not reveal another team's task
+            sql`${tasks.team_id} IS NOT DISTINCT FROM ${req.teamId ?? null}`
           )
         )
         .orderBy(desc(tasks.created_at))
@@ -88,11 +91,11 @@ tasksRouter.post("/tasks", async (req, res) => {
     dry_run: newTask.dry_run,
     correlated: false,
   });
-});
+}));
 
 // ─── Task list (paginated) ────────────────────────────────────────────────────
 
-tasksRouter.get("/tasks", async (req, res) => {
+tasksRouter.get("/tasks", asyncHandler(async (req, res) => {
   const pageSize = Math.min(Math.max(1, Number(req.query.limit) || 50), 200);
   const offset   = Math.max(0, Number(req.query.offset) || 0);
 
@@ -103,26 +106,39 @@ tasksRouter.get("/tasks", async (req, res) => {
         .orderBy(desc(tasks.created_at)).limit(pageSize).offset(offset);
 
   return res.json({ items: rows, limit: pageSize, offset });
-});
+}));
 
-tasksRouter.get("/tasks/:task_id", async (req, res) => {
-  const [task] = await db.select().from(tasks).where(eq(tasks.task_id, req.params.task_id));
-  if (!task) return res.status(404).json({ error: "Task not found" });
-  if (req.teamId && task.team_id && task.team_id !== req.teamId) return res.status(403).json({ error: "Forbidden" });
+/** Loads a task and enforces team ownership. Sends the error response itself and returns null on failure. */
+async function loadAuthorizedTask(taskId: string, teamId: string | undefined, res: Response) {
+  const [task] = await db.select().from(tasks).where(eq(tasks.task_id, taskId));
+  if (!task) { res.status(404).json({ error: "Task not found" }); return null; }
+  if (teamId && task.team_id && task.team_id !== teamId) { res.status(403).json({ error: "Forbidden" }); return null; }
+  return task;
+}
+
+tasksRouter.get("/tasks/:task_id", asyncHandler(async (req, res) => {
+  const task = await loadAuthorizedTask(req.params.task_id, req.teamId, res);
+  if (!task) return;
   return res.json(task);
-});
+}));
 
 // ─── Checkpoints + SSE ────────────────────────────────────────────────────────
 
-tasksRouter.get("/tasks/:task_id/checkpoints", async (req, res) => {
+tasksRouter.get("/tasks/:task_id/checkpoints", asyncHandler(async (req, res) => {
+  // Checkpoints contain full tool output — same team check as the task itself
+  const task = await loadAuthorizedTask(req.params.task_id, req.teamId, res);
+  if (!task) return;
   const rows = await db.select().from(checkpoints).where(eq(checkpoints.task_id, req.params.task_id));
   return res.json({ task_id: req.params.task_id, checkpoints: rows });
-});
+}));
 
 const SSE_TIMEOUT_MS = 10 * 60 * 1000; // 10 min — prevents zombie connections
+const SSE_HEARTBEAT_MS = 25 * 1000;    // keep proxies/load balancers from closing idle streams
 
-tasksRouter.get("/tasks/:task_id/stream", (req, res) => {
+tasksRouter.get("/tasks/:task_id/stream", asyncHandler(async (req, res) => {
   const { task_id } = req.params;
+  const task = await loadAuthorizedTask(task_id, req.teamId, res);
+  if (!task) return;
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
@@ -132,6 +148,10 @@ tasksRouter.get("/tasks/:task_id/stream", (req, res) => {
   taskEventEmitter.on(`checkpoint-${task_id}`, onUpdate);
   taskEventEmitter.on(`task-update-${task_id}`, onUpdate);
 
+  // Comment-only heartbeat frames keep intermediaries (nginx, ALB) from
+  // closing the connection during quiet stretches between checkpoints.
+  const heartbeat = setInterval(() => res.write(`: heartbeat\n\n`), SSE_HEARTBEAT_MS);
+
   // Auto-close if a task stays stuck and the client never disconnects
   const timeout = setTimeout(() => {
     res.write(`data: {"timeout":true}\n\n`);
@@ -140,19 +160,19 @@ tasksRouter.get("/tasks/:task_id/stream", (req, res) => {
 
   const cleanup = () => {
     clearTimeout(timeout);
+    clearInterval(heartbeat);
     taskEventEmitter.off(`checkpoint-${task_id}`, onUpdate);
     taskEventEmitter.off(`task-update-${task_id}`, onUpdate);
   };
   req.on("close", cleanup);
-});
+}));
 
 // ─── Resume ────────────────────────────────────────────────────────────────────
 
-tasksRouter.post("/tasks/:task_id/resume", async (req, res) => {
+tasksRouter.post("/tasks/:task_id/resume", asyncHandler(async (req, res) => {
   const { task_id } = req.params;
-  const [task] = await db.select().from(tasks).where(eq(tasks.task_id, task_id));
-  if (!task) return res.status(404).json({ error: "Task not found" });
-  if (req.teamId && task.team_id && task.team_id !== req.teamId) return res.status(403).json({ error: "Forbidden" });
+  const task = await loadAuthorizedTask(task_id, req.teamId, res);
+  if (!task) return;
   if (task.status !== "failed") return res.status(400).json({ error: "Only failed tasks can be resumed" });
 
   const [updated] = await db.update(tasks)
@@ -162,14 +182,13 @@ tasksRouter.post("/tasks/:task_id/resume", async (req, res) => {
 
   setImmediate(() => runTaskOrchestrator(task_id));
   return res.json({ task_id, status: "running", resume_count: updated.resume_count });
-});
+}));
 
 // ─── Post-mortem Markdown export ─────────────────────────────────────────────
 
-tasksRouter.get("/tasks/:task_id/export.md", async (req, res) => {
-  const [task] = await db.select().from(tasks).where(eq(tasks.task_id, req.params.task_id));
-  if (!task) return res.status(404).json({ error: "Task not found" });
-  if (req.teamId && task.team_id && task.team_id !== req.teamId) return res.status(403).json({ error: "Forbidden" });
+tasksRouter.get("/tasks/:task_id/export.md", asyncHandler(async (req, res) => {
+  const task = await loadAuthorizedTask(req.params.task_id, req.teamId, res);
+  if (!task) return;
   if (!task.final_output) return res.status(400).json({ error: "Task has no output yet" });
 
   const cps = await db.select().from(checkpoints).where(eq(checkpoints.task_id, task.task_id));
@@ -222,4 +241,4 @@ ${cps.map(c => `| ${c.step_number} | ${c.step_name.replace(/_/g, " ")} | ${c.ste
   res.setHeader("Content-Type", "text/markdown; charset=utf-8");
   res.setHeader("Content-Disposition", `attachment; filename="postmortem-${task.trace_id}.md"`);
   return res.send(md);
-});
+}));

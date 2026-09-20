@@ -1,10 +1,17 @@
 import "dotenv/config";
 import express from "express";
 import path from "path";
-import { createServer as createViteServer } from "vite";
 import { z } from "zod";
-import crypto from "crypto";
 import { eq } from "drizzle-orm";
+
+declare global {
+  namespace Express {
+    interface Request {
+      /** Raw request bytes — required for HMAC signature verification (Slack, webhooks). */
+      rawBody?: Buffer;
+    }
+  }
+}
 
 const ConfigSchema = z.object({
   OPENAI_API_KEY:              z.string().optional(),
@@ -26,18 +33,21 @@ const config = (() => {
 })();
 
 const app = express();
-app.use(express.json());
+// Capture raw bytes so Slack/webhook HMAC signatures can be verified against
+// the exact payload the sender signed (re-serialized JSON does not match).
+app.use(express.json({ verify: (req, _res, buf) => { (req as express.Request).rawBody = buf; } }));
 app.use(express.urlencoded({ extended: true }));
 
 // ─── Imports ──────────────────────────────────────────────────────────────────
 
 import { logger } from "./src/server/logger.js";
-import { sendSlackResponse } from "./src/server/slack.js";
+import { sendSlackResponse, verifySlackSignature } from "./src/server/slack.js";
 import { db, tasks } from "./src/server/db/index.js";
 import { runTaskOrchestrator, recoverStaleTasks } from "./src/server/executor.js";
 import { listMcpTools, closeMcpClient } from "./src/server/mcp.js";
 import { getLLMClient, LLM_MODELS } from "./src/server/llm.js";
-import { authMiddleware, isAuthEnabled } from "./src/server/auth.js";
+import { authMiddleware } from "./src/server/auth.js";
+import { asyncHandler, errorMiddleware } from "./src/server/http.js";
 import { parseLLMJson, generateTraceId, toErrorMessage } from "./src/utils/index.js";
 
 import { healthRouter }   from "./src/routes/health.js";
@@ -49,10 +59,40 @@ import { metricsRouter }  from "./src/routes/metrics.js";
 
 // ─── Public routes (no auth) ──────────────────────────────────────────────────
 
-app.post("/api/slack/events", async (req, res) => {
+// Slack retries events up to 3 times on slow/failed responses — track seen
+// event IDs for an hour so retries don't spawn duplicate investigations.
+const seenSlackEvents = new Map<string, number>();
+const SLACK_EVENT_DEDUP_TTL_MS = 60 * 60 * 1000;
+
+app.post("/api/slack/events", asyncHandler(async (req, res) => {
+  const signingSecret = process.env.SLACK_SIGNING_SECRET;
+  if (signingSecret) {
+    const valid = verifySlackSignature(
+      signingSecret,
+      req.headers["x-slack-request-timestamp"] as string | undefined,
+      req.rawBody ?? "",
+      req.headers["x-slack-signature"] as string | undefined
+    );
+    if (!valid) {
+      logger.warn("Rejected Slack event with invalid signature");
+      return res.status(401).json({ error: "Invalid Slack signature" });
+    }
+  } else if (process.env.NODE_ENV === "production") {
+    logger.warn("SLACK_SIGNING_SECRET not set — Slack events are unauthenticated");
+  }
+
   const body = req.body || {};
   if (body.type === "url_verification") {
     return res.status(200).type("text/plain").send(body.challenge);
+  }
+
+  if (body.event_id) {
+    const now = Date.now();
+    for (const [id, ts] of seenSlackEvents) {
+      if (now - ts > SLACK_EVENT_DEDUP_TTL_MS) seenSlackEvents.delete(id);
+    }
+    if (seenSlackEvents.has(body.event_id)) return res.status(200).send();
+    seenSlackEvents.set(body.event_id, now);
   }
 
   const { event } = body;
@@ -93,13 +133,24 @@ app.post("/api/slack/events", async (req, res) => {
       });
     }
   }
-});
+}));
 
 app.get("/api/slack/oauth_redirect", (_req, res) => {
   res.send("Slack OAuth redirect successful. You can close this window.");
 });
 
-app.get("/api/tools", async (_req, res) => {
+// Webhooks are public — no JWT required (they use their own signing verification)
+app.use("/api", webhooksRouter);
+
+app.use("/api", authRouter);
+
+// Health endpoints stay public so k8s liveness/readiness probes work without a JWT
+app.use("/api", healthRouter);
+
+// Apply JWT auth to all remaining /api routes
+app.use("/api", authMiddleware);
+
+app.get("/api/tools", asyncHandler(async (_req, res) => {
   try {
     const tools = await listMcpTools();
     return res.json({ tools });
@@ -107,10 +158,10 @@ app.get("/api/tools", async (_req, res) => {
     logger.error({ err }, "Failed to list MCP tools");
     return res.status(503).json({ error: "MCP tools server unavailable" });
   }
-});
+}));
 
 // Incident simulation (quick LLM call, not checkpointed — for demo purposes)
-app.post("/api/simulate", async (req, res) => {
+app.post("/api/simulate", asyncHandler(async (req, res) => {
   const { title, description, severity, channel } = req.body;
   if (!title || !description) return res.status(400).json({ error: "Missing incident title or description" });
 
@@ -155,25 +206,20 @@ app.post("/api/simulate", async (req, res) => {
   } catch (err) {
     return res.status(500).json({ error: "Simulation pipeline failed", details: toErrorMessage(err) });
   }
-});
+}));
 
-// Webhooks are public — no JWT required (they use their own signing verification)
-app.use("/api", webhooksRouter);
-
-app.use("/api", authRouter);
-
-// Apply JWT auth to all remaining /api routes
-app.use("/api", authMiddleware);
-
-app.use("/api", healthRouter);
 app.use("/api", tasksRouter);
 app.use("/api", memoryRouter);
 app.use("/api", metricsRouter);
+
+app.use(errorMiddleware);
 
 // ─── Frontend ─────────────────────────────────────────────────────────────────
 
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
+    // Dev-only dynamic import — keeps vite out of the production bundle/image
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
@@ -184,7 +230,8 @@ async function startServer() {
 
   const httpServer = app.listen(config.PORT, "0.0.0.0", async () => {
     console.log(`AgentCore running on http://localhost:${config.PORT}`);
-    await recoverStaleTasks();
+    // A transient DB error during recovery must not crash the freshly started server
+    await recoverStaleTasks().catch((err) => logger.error({ err }, "Stale task recovery failed"));
   });
 
   // ─── Graceful shutdown ──────────────────────────────────────────────────────

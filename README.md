@@ -1,16 +1,87 @@
 # AgentCore
 
 [![CI](https://github.com/TheProdSDE/agentcore/actions/workflows/ci.yml/badge.svg)](https://github.com/TheProdSDE/agentcore/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-127%20passing-brightgreen?logo=vitest&logoColor=white)](https://github.com/TheProdSDE/agentcore/actions)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-24-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-theprodsde-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://www.buymeacoffee.com/theprodsde)
-[![PayPal](https://img.shields.io/badge/PayPal-Donate-00457C?logo=paypal&logoColor=white)](https://www.paypal.com/paypalme/karangehlod)
 
-An AI-powered incident response orchestrator. AgentCore runs a resilient 4-step pipeline — memory retrieval, LLM planning, MCP tool execution, and synthesis — with per-step checkpointing so tasks survive failures and resume exactly where they left off.
+**Self-hosted, stack-agnostic AI incident triage — with checkpointed resume and episodic memory.**
 
-Trigger incidents from Slack or the web dashboard. Every run is traced, checkpointed, and written back into an episodic memory store so the planner learns from past incidents.
+When an alert fires, AgentCore runs a 4-step pipeline — recall similar past incidents, plan tool calls with an LLM, query your logs/metrics/runbooks via MCP, synthesize a report — and posts the analysis back to Slack in ~30 seconds. Every step is checkpointed to Postgres (a crash mid-investigation resumes from the failed step, not from scratch), and every resolved incident is written back into pgvector memory, so the second DB deadlock surfaces what fixed the first one.
+
+The closed alternatives (PagerDuty AIOps, incident.io, Datadog) are expensive and take your incident data with them. The open ones are mostly Kubernetes-only. AgentCore is Apache-2.0, runs on your infra against whatever stack you have (Loki, Prometheus, Linear today — [add your own tool](CONTRIBUTING.md) in one file), and works with local models so **no incident data ever leaves your network**.
+
+## Try it in 90 seconds — no API keys
+
+Every tool has a deterministic simulation fallback, so the full stack runs with zero credentials:
+
+```bash
+git clone https://github.com/theprodsde/agentcore && cd agentcore
+docker compose up --build
+```
+
+Then open `http://localhost:3000`, hit **New Task**, and describe an incident — try
+`payments-service p99 latency at 4s after deploy`. Or from the terminal:
+
+```bash
+curl -X POST http://localhost:3000/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"goal": "payments-service p99 latency at 4s after deploy"}'
+```
+
+Watch the 4-step checkpoint timeline stream live, then grab the post-mortem at `/api/tasks/<task_id>/export.md`. Add `OPENAI_API_KEY` (or [point it at Ollama](#local-models--ollama)) for real LLM planning, and backend URLs for real data — same pipeline, no code changes.
+
+<details>
+<summary><b>What the output looks like</b> — an exported post-mortem from the zero-credential demo above</summary>
+
+```markdown
+# Post-Mortem: payments-service p99 latency at 4s after deploy
+
+**Trace ID:** `tr-7q6d5xhl9-8193`
+**Total duration:** 8.3s
+**Retries:** 0
+
+## Summary
+
+The payments-service experienced a significant increase in latency, rising to
+4230 ms within the last hour, triggering a threshold breach. Multiple errors,
+including deadlocks and lock wait timeouts, were logged during this period.
+
+## Probable Cause
+
+The combination of high latency and deadlock conditions is likely due to
+resource contention or saturation within the payments-service and its database
+interactions, specifically related to transaction locking.
+
+## Affected Systems
+
+- `payments-service`
+- `postgres-primary`
+
+## Next Actions
+
+1. Review and scale horizontal replicas of the payments-service to handle the increased load.
+2. Investigate the cause of deadlocks and optimize database queries to reduce contention.
+3. Consult the High Latency Runbook for payments-service for further troubleshooting steps.
+
+## Ticket
+
+`INC-20260920-001`
+
+## Checkpoint Timeline
+
+| Step | Name | Status | Duration |
+|------|------|--------|----------|
+| 1 | memory retrieval | success | 1.3s |
+| 2 | planner | success | 4.7s |
+| 3 | execution | success | 7ms |
+| 4 | synthesizer | success | 2.4s |
+```
+
+With `OPENAI_API_KEY` set, the report is synthesized by the LLM from real tool output; without it, it's derived deterministically from the simulated data — same structure either way.
+
+</details>
 
 ## Who is this for, and when should you use it
 
@@ -139,8 +210,49 @@ If any step fails, the task pauses. On resume, completed checkpoints are skipped
 | Post-mortem export | `GET /api/tasks/:id/export.md` — downloadable Markdown post-mortem |
 | Metrics dashboard | `/metrics` page + `/api/metrics` endpoint — 30-day summary, step p95, weekly trend |
 | CLI | `node scripts/run.mjs "<goal>"` — run investigations from the terminal with live streaming |
+| MCP server | Expose AgentCore itself to Claude Code / Claude Desktop / Cursor — investigate, query memory, export post-mortems from any MCP client |
 | Dry-run mode | `dry_run: true` — full pipeline without writing to memory or creating tickets |
 | Graceful shutdown | SIGTERM → flush OTel spans → drain DB pool → close MCP subprocess |
+
+## Use AgentCore from Claude (MCP)
+
+AgentCore ships an MCP server that exposes a running instance to any MCP client — Claude Code, Claude Desktop, Cursor. Ask Claude *"investigate the latency spike on payments-service"* and it runs a full checkpointed investigation with your team's incident memory behind it.
+
+```bash
+# Claude Code
+claude mcp add agentcore --env AGENTCORE_URL=http://localhost:3000 \
+  -- node /path/to/agentcore/dist/tools/agentcore-mcp.cjs
+```
+
+```json
+// Claude Desktop (claude_desktop_config.json)
+{
+  "mcpServers": {
+    "agentcore": {
+      "command": "node",
+      "args": ["/path/to/agentcore/dist/tools/agentcore-mcp.cjs"],
+      "env": { "AGENTCORE_URL": "http://localhost:3000", "AGENTCORE_TOKEN": "eyJ... (only if JWT auth is enabled)" }
+    }
+  }
+}
+```
+
+Exposed tools: `investigate_incident` (runs the pipeline, waits for the report), `get_investigation` (status + checkpoint timeline), `search_incident_memory` (semantic search over past incidents), `export_postmortem` (Markdown). During development, `npm run mcp` runs it from source.
+
+## Local models / Ollama
+
+AgentCore speaks the OpenAI API, so any compatible endpoint works — including [Ollama](https://ollama.com). No incident data leaves your network:
+
+```bash
+ollama pull qwen2.5:14b   # any tool-capable instruct model works
+
+# .env
+OPENAI_BASE_URL=http://localhost:11434/v1
+OPENAI_API_KEY=ollama          # any non-empty value
+LLM_MODEL=qwen2.5:14b
+```
+
+The planner and synthesizer now run fully local. One honest caveat: the memory store expects 1536-dimension embeddings (`text-embedding-3-small`). If your local endpoint can't serve a 1536-dim embedding model, embedding calls fail gracefully and memory retrieval falls back to recency + keyword ranking — everything still works, semantic recall is just weaker. Configurable embedding dimensions are on the [roadmap](ROADMAP.md).
 
 ## Quickstart
 
@@ -150,6 +262,12 @@ If any step fails, the task pauses. On resume, completed checkpoints are skipped
 cp .env.example .env
 # fill in OPENAI_API_KEY and optionally Slack/Linear credentials
 docker-compose up --build
+```
+
+Prebuilt images are published to GHCR on every release:
+
+```bash
+docker pull ghcr.io/theprodsde/agentcore:latest
 ```
 
 - App: `http://localhost:3000`
@@ -180,7 +298,7 @@ npm run dev
 | `EMBEDDING_MODEL` | No | Embedding model (default: `text-embedding-3-small`) |
 | `JWT_SECRET` | No | Enables JWT auth when set. Unset = auth disabled (dev mode) |
 | `SLACK_BOT_TOKEN` | No | Enables real Slack message delivery |
-| `SLACK_SIGNING_SECRET` | No | Slack event verification |
+| `SLACK_SIGNING_SECRET` | No | Verifies Slack event signatures (v0 HMAC + replay protection). Unset = events accepted unverified (dev only) |
 | `MCP_SERVER_URL` | No | External MCP server (SSE). Unset = spawns bundled tools server |
 | `LOKI_URL` | No | Loki log backend for `search_logs` tool |
 | `PROMETHEUS_URL` | No | Prometheus backend for `get_metrics` tool |
@@ -191,6 +309,7 @@ npm run dev
 | `OPSGENIE_WEBHOOK_SECRET` | No | HMAC secret for OpsGenie webhook verification |
 | `ALERTMANAGER_SECRET` | No | Shared secret header for Alertmanager webhook |
 | `TOOL_BUDGET_MS` | No | Max total tool execution time per task in ms (default: `15000`) |
+| `TOOL_CALL_TIMEOUT_MS` | No | Hard wall-clock timeout per MCP tool call in ms (default: `10000`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTLP endpoint for Jaeger/Grafana Tempo |
 | `LOG_LEVEL` | No | Pino log level (default: `warn`) |
 
@@ -251,9 +370,10 @@ tools/
   README.md             How to add tools and connect real backends
 tests/
   unit/
-    algorithms.test.ts  127 tests: Levenshtein, LCS, Knapsack, top-k, Jaccard, LRU, similarity
+    algorithms.test.ts  Levenshtein, LCS, Knapsack, top-k, Jaccard, LRU, similarity
     auth.test.ts        JWT, API key hashing, middleware
     executor.test.ts    deriveSynthesisFromOutput, planner/synthesizer output contracts
+    slack.test.ts       Slack request signature verification (HMAC v0, replay protection)
     tools.test.ts       parseRange, filter logic, metric simulation, output shapes
     utils.test.ts       parseLLMJson, generateTraceId, toErrorMessage
 ```
@@ -281,7 +401,9 @@ See [PRODUCTION.md](PRODUCTION.md) for how to swap each stub for a real integrat
 
 ## Contributing
 
-Pull requests are welcome. Please read the [PR template](.github/PULL_REQUEST_TEMPLATE.md) before opening one — it's short. The checklist covers the basics: types clean, tests green, no secrets in the diff.
+Pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for setup and conventions. The best first contribution is a new tool backend (Elasticsearch, Grafana, Jira, Datadog, ...): the whole pattern lives in one file, and issues labeled `good first issue` + `tool-integration` have step-by-step specs.
+
+Please read the [PR template](.github/PULL_REQUEST_TEMPLATE.md) before opening a PR — it's short. The checklist covers the basics: types clean, tests green, no secrets in the diff.
 
 For bugs, use the [bug report](.github/ISSUE_TEMPLATE/bug_report.yml) template. For new tools or integrations, use the [feature request](.github/ISSUE_TEMPLATE/feature_request.yml) template.
 

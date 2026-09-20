@@ -91,8 +91,11 @@
 ## Up next
 
 - [ ] `eslint` + `prettier` added to CI
-- [ ] `CONTRIBUTING.md` with branch naming and PR guide
+- [x] `CONTRIBUTING.md` with dev setup and tool-integration guide
 - [ ] Redis for the task queue (multi-instance deployments)
+- [ ] Configurable embedding dimensions (unblocks fully-local Ollama embeddings; currently fixed at 1536)
+- [ ] More tool backends via community: Elasticsearch logs, GitHub Issues tickets, Grafana annotations, Datadog metrics (see `good first issue` label)
+- [ ] Rate limiting on task-creating endpoints (LLM spend protection)
 - [ ] Slack app-home tab showing tasks inline
 - [ ] Runbook auto-import from Confluence / Notion at startup
 - [ ] pgvector-based dedup (replace JS Jaccard+edit with a single DB query)
