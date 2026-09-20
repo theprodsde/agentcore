@@ -3,6 +3,10 @@
 Thanks for considering a contribution. The fastest way to be useful here is to add
 or improve an **MCP tool integration** — that's the layer the community grows through.
 
+For anything bigger (a new pipeline step, alert source, or API domain), read
+[ARCHITECTURE.md](ARCHITECTURE.md) first — it maps every extension point and the
+invariants PRs must respect.
+
 ## Dev setup
 
 ```bash
@@ -11,8 +15,7 @@ cp .env.example .env          # DATABASE_URL is the only hard requirement
 docker run -d --name agentcore-pg -e POSTGRES_USER=agentcore \
   -e POSTGRES_PASSWORD=agentcore -e POSTGRES_DB=agentcore \
   -p 5432:5432 pgvector/pgvector:pg16
-docker exec agentcore-pg psql -U agentcore -d agentcore -c "CREATE EXTENSION IF NOT EXISTS vector;"
-npm run db:migrate
+npm run db:migrate            # creates the pgvector extension + applies migrations
 npm run dev                   # http://localhost:3000
 ```
 
@@ -23,8 +26,15 @@ deterministic simulations, which is exactly what the test suite exercises.
 
 ```bash
 npm run lint      # tsc --noEmit — must be clean
-npm test          # vitest — must be green
+npm test          # unit tests (vitest) — must be green
 npm run build     # production bundles must compile
+```
+
+There's also an integration suite covering checkpoint/resume against real Postgres —
+CI runs it automatically; locally it needs a pgvector database:
+
+```bash
+TEST_DATABASE_URL=postgres://agentcore:agentcore@localhost:5432/agentcore npm run test:integration
 ```
 
 The [PR template](.github/PULL_REQUEST_TEMPLATE.md) checklist covers the same three

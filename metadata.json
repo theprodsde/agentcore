@@ -1,5 +1,0 @@
-{
-  "name": "AgentCore",
-  "description": "AI-powered incident response orchestrator with checkpointing, episodic memory, MCP tool execution, and Slack integration.",
-  "version": "0.1.0"
-}

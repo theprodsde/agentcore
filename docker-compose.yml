@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -30,19 +28,25 @@ services:
     build: .
     ports:
       - "3000:3000"
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
+    # Secrets and optional integrations come from .env (cp .env.example .env).
+    # Optional so `docker compose up` works with zero setup (simulation mode).
+    env_file:
+      - path: .env
+        required: false
     environment:
       NODE_ENV: production
       DATABASE_URL: postgres://agentcore:agentcore@postgres:5432/agentcore
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
-      # OPENAI_API_KEY: your-key-here
-      # OPENAI_BASE_URL: https://api.openai.com/v1
-      # SLACK_BOT_TOKEN: xoxb-...
-      # SLACK_SIGNING_SECRET: ...
-      # MCP_SERVER_URL: ...
-      # JWT_SECRET: change-me-in-production
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
 volumes:
   postgres_data:

@@ -18,6 +18,12 @@ if (!url) {
 
 const client = postgres(url, { max: 1, connect_timeout: 10 });
 try {
+  // Self-bootstrap pgvector — the schema needs it and it's idempotent. On
+  // managed Postgres where the role can't create extensions, this warns and
+  // proceeds; the migration below fails with a clear error if it's truly absent.
+  await client.unsafe("CREATE EXTENSION IF NOT EXISTS vector").catch((err) => {
+    console.warn("Could not create pgvector extension (may already exist or need a superuser):", err.message);
+  });
   await migrate(drizzle(client), { migrationsFolder: "drizzle" });
   console.log("Migrations applied");
 } catch (err) {

@@ -19,9 +19,6 @@ function getSecret(): Uint8Array | null {
 /** True when JWT_SECRET is set — re-evaluated on every call so tests can toggle it. */
 export function isAuthEnabled(): boolean { return !!process.env.JWT_SECRET; }
 
-/** @deprecated use isAuthEnabled() — kept for existing callers that need a boolean */
-export const AUTH_ENABLED = false; // actual enforcement uses isAuthEnabled() at runtime
-
 // ─── Token management ─────────────────────────────────────────────────────────
 
 export async function signToken(teamId: string): Promise<string> {

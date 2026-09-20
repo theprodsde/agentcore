@@ -12,14 +12,16 @@ When an alert fires, AgentCore runs a 4-step pipeline — recall similar past in
 
 The closed alternatives (PagerDuty AIOps, incident.io, Datadog) are expensive and take your incident data with them. The open ones are mostly Kubernetes-only. AgentCore is Apache-2.0, runs on your infra against whatever stack you have (Loki, Prometheus, Linear today — [add your own tool](CONTRIBUTING.md) in one file), and works with local models so **no incident data ever leaves your network**.
 
-## Try it in 90 seconds — no API keys
+## Try it in 90 seconds — no clone, no API keys
 
-Every tool has a deterministic simulation fallback, so the full stack runs with zero credentials:
+Every tool has a deterministic simulation fallback, so the full stack runs with zero credentials. Two commands, using the prebuilt image from GHCR:
 
 ```bash
-git clone https://github.com/theprodsde/agentcore && cd agentcore
-docker compose up --build
+curl -fsSL https://raw.githubusercontent.com/theprodsde/agentcore/main/docker-compose.demo.yml -o agentcore-demo.yml
+docker compose -f agentcore-demo.yml up
 ```
+
+(Have an OpenAI key? `OPENAI_API_KEY=sk-... docker compose -f agentcore-demo.yml up` upgrades planning and synthesis to a real LLM. Prefer building from source? `git clone https://github.com/theprodsde/agentcore && cd agentcore && docker compose up --build`.)
 
 Then open `http://localhost:3000`, hit **New Task**, and describe an incident — try
 `payments-service p99 latency at 4s after deploy`. Or from the terminal:
@@ -33,7 +35,7 @@ curl -X POST http://localhost:3000/api/tasks \
 Watch the 4-step checkpoint timeline stream live, then grab the post-mortem at `/api/tasks/<task_id>/export.md`. Add `OPENAI_API_KEY` (or [point it at Ollama](#local-models--ollama)) for real LLM planning, and backend URLs for real data — same pipeline, no code changes.
 
 <details>
-<summary><b>What the output looks like</b> — an exported post-mortem from the zero-credential demo above</summary>
+<summary><b>What the output looks like</b> — a real exported post-mortem (LLM-synthesized from simulated tool data)</summary>
 
 ```markdown
 # Post-Mortem: payments-service p99 latency at 4s after deploy
@@ -282,8 +284,7 @@ cp .env.example .env   # fill in DATABASE_URL + OPENAI_API_KEY
 docker run -d --name agentcore-pg -e POSTGRES_USER=agentcore \
   -e POSTGRES_PASSWORD=agentcore -e POSTGRES_DB=agentcore \
   -p 5432:5432 pgvector/pgvector:pg16
-docker exec agentcore-pg psql -U agentcore -d agentcore -c "CREATE EXTENSION IF NOT EXISTS vector;"
-npm run db:migrate    # apply versioned migrations (use db:push for quick local dev)
+npm run db:migrate    # creates the pgvector extension + applies versioned migrations
 npm run dev
 ```
 
@@ -310,6 +311,12 @@ npm run dev
 | `ALERTMANAGER_SECRET` | No | Shared secret header for Alertmanager webhook |
 | `TOOL_BUDGET_MS` | No | Max total tool execution time per task in ms (default: `15000`) |
 | `TOOL_CALL_TIMEOUT_MS` | No | Hard wall-clock timeout per MCP tool call in ms (default: `10000`) |
+| `LLM_TIMEOUT_MS` | No | Timeout per LLM API call in ms (default: `60000`) |
+| `RATE_LIMIT_RPM` | No | Max task creations per minute per team/IP/channel (default: `30`, `0` disables) |
+| `RETENTION_DAYS` | No | Purge tasks + checkpoints older than N days (default: keep forever) |
+| `MEMORY_RETENTION_DAYS` | No | Purge episodic memories older than N days (default: keep forever) |
+| `DEFAULT_TEAM_ID` | No | Team that owns Slack/webhook-created tasks. Unset = visible to all teams (single-tenant only) |
+| `DISABLE_TEAM_SIGNUP` | No | `true` blocks `POST /api/teams` after initial bootstrap |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTLP endpoint for Jaeger/Grafana Tempo |
 | `LOG_LEVEL` | No | Pino log level (default: `warn`) |
 
@@ -334,6 +341,10 @@ curl http://localhost:3000/api/tasks \
 ```
 
 Tasks and memories are isolated per team. A token from team A cannot read team B's data.
+
+The web dashboard shows a login screen automatically when auth is enabled — paste a team API key and it's exchanged for a session token (stored locally, re-prompted on expiry).
+
+![Login](.github/assets/07-login.png) Manage keys via `GET`/`POST`/`DELETE /api/teams/:team_id/api-keys` — the last remaining key cannot be revoked, so a team can't lock itself out. Set `DISABLE_TEAM_SIGNUP=true` once your teams exist, and `DEFAULT_TEAM_ID` so Slack/webhook-created tasks belong to a team instead of being globally visible.
 
 ## Project structure
 
@@ -397,7 +408,7 @@ See [tools/README.md](tools/README.md). Add the tool definition to `TOOL_REGISTR
 
 ## Production path
 
-See [PRODUCTION.md](PRODUCTION.md) for how to swap each stub for a real integration. See [DEVELOPMENT.md](DEVELOPMENT.md) for the full phase roadmap.
+See [PRODUCTION.md](PRODUCTION.md) for how to swap each stub for a real integration. See [ARCHITECTURE.md](ARCHITECTURE.md) for the system map, extension points (new tools, pipeline steps, alert sources), and the scaling seams where future features land. See [DEVELOPMENT.md](DEVELOPMENT.md) for the full phase roadmap.
 
 ## Contributing
 

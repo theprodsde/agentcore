@@ -41,7 +41,11 @@ This boots pgvector Postgres, Jaeger, and the app. On startup the app applies ve
 | `JWT_SECRET` | Without it, **every API endpoint is open** — anyone can read tasks, memories, and create investigations |
 | `SLACK_SIGNING_SECRET` | Without it, anyone who discovers the URL can forge Slack events and trigger LLM-backed investigations (token cost + data exposure) |
 | Webhook secrets (`PAGERDUTY_WEBHOOK_SECRET`, `OPSGENIE_WEBHOOK_SECRET`, `ALERTMANAGER_SECRET`) | Webhook endpoints are public by design; unsigned = anyone can create tasks |
-| Reverse proxy with TLS + rate limiting | AgentCore does not terminate TLS or rate-limit; put nginx/Caddy/an ALB in front |
+| `DISABLE_TEAM_SIGNUP=true` | After creating your teams — otherwise anyone who reaches the server can mint a tenant |
+| `DEFAULT_TEAM_ID` | Slack/webhook tasks without it have no team and are visible to every authenticated team |
+| `RATE_LIMIT_RPM` | Built-in token-bucket limit on task creation (default 30/min per team/IP/channel). Keep it, and set spend limits on your LLM key |
+| `RETENTION_DAYS` | Checkpoints store raw log/metric output — decide how long incident data may live in this DB |
+| Reverse proxy with TLS | AgentCore does not terminate TLS; put nginx/Caddy/an ALB in front (and rate-limit non-task endpoints there) |
 
 Signature verification is performed against the **raw request bytes** (captured before JSON parsing), with timing-safe comparison and, for Slack, a 5-minute replay window.
 
@@ -109,9 +113,10 @@ Point your alert source at:
 
 - **Single-process task queue.** Tasks run in-process via `setImmediate`. If the process dies mid-task, checkpoints preserve progress and `recoverStaleTasks()` resumes on restart — but running two app replicas will double-process recovered tasks. Run one replica, or swap dispatch for BullMQ before scaling out.
 - **SSE task streams are per-process.** With multiple replicas behind a load balancer, a client may connect to a replica that isn't executing its task. Use sticky sessions or single-replica until a shared event bus exists.
-- **No rate limiting or request quotas.** Every accepted task costs LLM tokens. Front with a rate limiter, and set spend limits on your OpenAI key.
-- **Team creation (`POST /api/teams`) is open** so the first team can bootstrap itself. Restrict it at the proxy after initial setup.
-- **Tool result cache and embedding cache are in-memory** — they reset on restart and are not shared across replicas.
+- **Rate limiting covers task creation only** (token bucket, `RATE_LIMIT_RPM`). Read endpoints rely on your proxy. Set spend limits on your LLM key regardless.
+- **Team creation (`POST /api/teams`) is open by default** so the first team can bootstrap itself. Set `DISABLE_TEAM_SIGNUP=true` after setup.
+- **Tool result, embedding, and rate-limit state are in-memory** — they reset on restart and are not shared across replicas.
+- **LLM prompts include attacker-influenceable text** (log lines, alert payloads). See the prompt-injection note in [SECURITY.md](SECURITY.md).
 
 ---
 

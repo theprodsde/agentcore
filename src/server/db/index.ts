@@ -18,3 +18,18 @@ const client = postgres(connectionString, {
 export const db = drizzle(client, { schema });
 
 export * from "./schema";
+
+/**
+ * Memory columns for reads. Excludes `embedding` — each vector is ~6 KB and is
+ * only meaningful to pgvector operators, so selecting it inflates every list
+ * response and retrieval query by hundreds of KB for no consumer benefit.
+ */
+export const memorySummaryColumns = {
+  memory_id:  schema.memories.memory_id,
+  task_id:    schema.memories.task_id,
+  team_id:    schema.memories.team_id,
+  goal:       schema.memories.goal,
+  outcome:    schema.memories.outcome,
+  score:      schema.memories.score,
+  created_at: schema.memories.created_at,
+} as const;

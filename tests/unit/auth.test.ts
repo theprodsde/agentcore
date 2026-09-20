@@ -92,12 +92,18 @@ describe("authMiddleware", () => {
 
   beforeEach(() => { next.mockClear(); });
 
-  it("calls next() without checking token when JWT_SECRET is not set", () => {
+  it("calls next() without checking the token when JWT_SECRET is not set", () => {
     const saved = process.env.JWT_SECRET;
     delete process.env.JWT_SECRET;
-    // Re-import with fresh env — simulate AUTH_ENABLED = false by calling middleware directly
-    // AUTH_ENABLED is evaluated at import time, so we test the exported constant separately
-    process.env.JWT_SECRET = saved;
+    try {
+      const req = makeReq(undefined);
+      const res = makeRes();
+      authMiddleware(req, res, next);
+      expect(next).toHaveBeenCalledOnce();
+      expect(res.status).not.toHaveBeenCalled();
+    } finally {
+      process.env.JWT_SECRET = saved;
+    }
   });
 
   it("returns 401 when Authorization header is missing", async () => {

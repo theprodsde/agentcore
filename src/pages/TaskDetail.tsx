@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback, useMemo } from "react";
 import { useParams } from "react-router-dom";
-import { fetchTask, fetchCheckpoints, resumeTask } from "../lib/api";
+import { fetchTask, fetchCheckpoints, resumeTask, streamTask } from "../lib/api";
 import { Task, Checkpoint } from "../types";
 import {
   CheckCircle2, Circle, AlertCircle, RefreshCw, Terminal,
@@ -34,36 +34,24 @@ export default function TaskDetail() {
   }, [taskId]);
 
   useEffect(() => {
+    if (!taskId) return;
     loadData(); // always load current state on mount
 
-    // Connect to SSE stream for live updates while task is active
-    let es: EventSource | null = null;
+    // Fetch-based SSE (sends the auth header, unlike EventSource) for live updates
+    const close = streamTask(
+      taskId,
+      (event) => {
+        // Any event means state changed — reload full task + checkpoints
+        loadData();
+        // Disconnect once terminal state reached
+        if (event.status === "completed" || event.status === "failed") close();
+      },
+      // Fallback to a delayed reload if the stream drops (e.g. proxy closes it)
+      () => setTimeout(loadData, 2000)
+    );
 
-    const connectStream = () => {
-      es = new EventSource(`/api/tasks/${taskId}/stream`);
-
-      es.onmessage = (e) => {
-        try {
-          const event = JSON.parse(e.data);
-          // Any event means state changed — reload full task + checkpoints
-          loadData();
-          // Disconnect once terminal state reached
-          if (event.status === "completed" || event.status === "failed") {
-            es?.close();
-          }
-        } catch { /* ignore malformed */ }
-      };
-
-      es.onerror = () => {
-        es?.close();
-        // Fallback to polling if SSE fails (e.g. proxy drops the connection)
-        setTimeout(loadData, 2000);
-      };
-    };
-
-    connectStream();
-    return () => es?.close();
-  }, [taskId]);
+    return close;
+  }, [taskId, loadData]);
 
   const handleResume = async () => {
     if (!taskId) return;

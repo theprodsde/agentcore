@@ -2,7 +2,7 @@
  * AgentCore MCP Tool Server
  *
  * Runs as a subprocess communicating over stdio.
- * Exposes four tools: search_logs, get_metrics, create_ticket, list_services.
+ * Exposes five tools: search_logs, get_metrics, search_runbook, create_ticket, list_services.
  *
  * Each tool checks for a real backend env var first; falls back to a
  * deterministic simulation so the stack works without any external infra.

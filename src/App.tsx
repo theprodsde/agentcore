@@ -2,6 +2,7 @@ import React from "react";
 import { BrowserRouter as Router, Routes, Route, Link, useLocation } from "react-router-dom";
 import { Activity, LayoutDashboard, PlusCircle, Brain, PlaySquare, BarChart2 } from "lucide-react";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { AuthGate } from "./components/AuthGate";
 import { cn } from "./lib/utils";
 import Dashboard from "./pages/Dashboard";
 import NewTask from "./pages/NewTask";
@@ -12,7 +13,8 @@ import MetricsDashboard from "./pages/MetricsDashboard";
 
 export default function App() {
   return (
-    <Router>
+    <AuthGate>
+      <Router>
       <div className="flex h-screen w-full bg-[#FAFAFA] text-slate-900 font-sans">
         <aside className="w-64 border-r border-slate-200 bg-white flex flex-col items-start justify-start flex-shrink-0">
           <div className="h-16 w-full flex items-center px-6 border-b border-slate-100">
@@ -43,7 +45,8 @@ export default function App() {
           </ErrorBoundary>
         </main>
       </div>
-    </Router>
+      </Router>
+    </AuthGate>
   );
 }
 

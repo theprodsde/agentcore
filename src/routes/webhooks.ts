@@ -6,6 +6,8 @@ import crypto from "crypto";
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { db, tasks } from "../server/db/index.js";
 import { runTaskOrchestrator } from "../server/executor.js";
+import { allowTaskCreation } from "../server/rateLimit.js";
+import { clampGoal, clampContext } from "../server/validation.js";
 import { generateTraceId } from "../utils/index.js";
 import { logger } from "../server/logger.js";
 
@@ -62,15 +64,23 @@ export const webhooksRouter = Router();
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async function createTaskFromAlert(goal: string, context: string, source: string) {
+  if (!allowTaskCreation(`webhook:${source}`)) {
+    logger.warn({ source }, "Webhook task creation rate-limited");
+    return null;
+  }
+
   const traceId = generateTraceId();
   const [newTask] = await db.insert(tasks).values({
-    goal,
-    context: `Auto-triggered from ${source}: ${context}`,
+    goal: clampGoal(goal),
+    context: clampContext(`Auto-triggered from ${source}: ${context}`),
     task_type: "incident",
     user_id: `webhook:${source}`,
     trace_id: traceId,
     inject_failure: false,
     dry_run: false,
+    // Alert-driven tasks belong to the configured default team; null (visible to
+    // all authenticated teams) is only acceptable in single-tenant setups.
+    team_id: process.env.DEFAULT_TEAM_ID || null,
   }).returning();
 
   setImmediate(() => runTaskOrchestrator(newTask.task_id));

@@ -19,7 +19,7 @@ interface CacheEntry<V> {
   key: string;
 }
 
-class LRUTTLCache<V> {
+export class LRUTTLCache<V> {
   private map = new Map<string, CacheEntry<V>>();
   private head: CacheEntry<V>; // dummy MRU sentinel
   private tail: CacheEntry<V>; // dummy LRU sentinel

@@ -32,3 +32,20 @@ exposing it anywhere, work through the security checklist in
 Reports about deployments that ignore that checklist (e.g. "auth is off when JWT_SECRET
 is unset") are working as documented, not vulnerabilities — but if the documentation
 misled you, that's a bug worth filing.
+
+## Prompt injection — known surface, bounded by design
+
+Log lines, alert payloads, and runbook text flow into the planner and synthesizer
+LLM prompts, and an attacker who can write to your logs can influence that text.
+The blast radius is deliberately bounded:
+
+- **Nothing executes after synthesis.** The LLM's output is a report; AgentCore never
+  runs remediation commands, so injected instructions cannot trigger actions.
+- **Tool arguments are Zod-validated** in the tool server, and side-effect tools
+  (`create_ticket`) are skipped on dry runs and never cached.
+- Worst realistic outcome: a misleading report, ticket, or memory entry. Treat AI
+  findings as triage input, not ground truth — that's also why the checkpoint record
+  preserves the raw tool output for human verification.
+
+Reports that *escalate* beyond this boundary (e.g. injected content causing tool
+execution outside the validated plan) are very much in scope — please report them.

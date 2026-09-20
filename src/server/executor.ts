@@ -1,7 +1,7 @@
 import { EventEmitter } from "events";
 import crypto from "crypto";
 import { eq, and, gte, inArray, sql, desc } from "drizzle-orm";
-import { db, tasks, checkpoints, memories } from "./db/index";
+import { db, tasks, checkpoints, memories, memorySummaryColumns } from "./db/index";
 import { logger } from "./logger";
 import { getMcpClient, executeMcpTool, getMcpToolSummary } from "./mcp";
 import { embed } from "./embeddings";
@@ -110,7 +110,7 @@ async function executeStep(
 
 export async function memoryRetrievalHandler(goal: string, teamId: string | null = null): Promise<Record<string, unknown>> {
   const queryEmbedding = await embed(goal);
-  let related: typeof memories.$inferSelect[] = [];
+  let related: { goal: string; outcome: string; score: number; created_at: Date }[] = [];
 
   // Memories are strictly team-scoped: a team's incidents must never surface in
   // another team's LLM context. Tasks without a team only see team-less memories.
@@ -118,8 +118,9 @@ export async function memoryRetrievalHandler(goal: string, teamId: string | null
 
   if (queryEmbedding) {
     // Fetch top 20 by cosine similarity, then re-rank with time-decay weighting
-    // using top-k selection (O(n·log k)) instead of full sort (O(n log n))
-    const candidates = await db.select().from(memories)
+    // using top-k selection (O(n·log k)) instead of full sort (O(n log n)).
+    // Only the summary columns are selected — the vectors stay in the database.
+    const candidates = await db.select(memorySummaryColumns).from(memories)
       .where(sql`${memories.embedding} IS NOT NULL AND ${teamFilter}`)
       .orderBy(sql`${memories.embedding} <=> ${JSON.stringify(queryEmbedding)}::vector`)
       .limit(20);
@@ -134,7 +135,8 @@ export async function memoryRetrievalHandler(goal: string, teamId: string | null
 
     related = topK(scored, 3, (m) => m._effective_score);
   } else {
-    related = await db.select().from(memories).where(teamFilter).orderBy(desc(memories.created_at)).limit(3);
+    related = await db.select(memorySummaryColumns).from(memories)
+      .where(teamFilter).orderBy(desc(memories.created_at)).limit(3);
   }
 
   return {
@@ -255,7 +257,6 @@ export async function executionHandler(
   injectFailure: boolean,
   dryRun = false
 ): Promise<Record<string, unknown>> {
-  const mcpClient = await getMcpClient();
   let toolCalls = planContext.tool_calls;
 
   // Enforce dry-run at the execution boundary — the planner prompt asks the LLM
@@ -264,7 +265,11 @@ export async function executionHandler(
     toolCalls = toolCalls.filter((c) => !SIDE_EFFECT_TOOLS.has(c.tool));
   }
 
-  if (mcpClient && !injectFailure && Array.isArray(toolCalls) && toolCalls.length > 0) {
+  // Only connect (and potentially spawn the tools subprocess) when it can be used
+  const canUseMcp = !injectFailure && Array.isArray(toolCalls) && toolCalls.length > 0;
+  const mcpClient = canUseMcp ? await getMcpClient() : null;
+
+  if (mcpClient && Array.isArray(toolCalls) && toolCalls.length > 0) {
     // 0/1 Knapsack: prune tool set to fit within budget using historical avg durations
     // Avoids blowing the step SLO when the planner selects many expensive tools.
     const STEP_BUDGET_MS = Number(process.env.TOOL_BUDGET_MS ?? 15_000);
@@ -372,6 +377,56 @@ function calculateMemoryScore(resumeCount: number, synth: SynthOutput): number {
   return Math.min(1.0, Math.max(0.3, parseFloat(score.toFixed(2))));
 }
 
+// ─── Pipeline definition ──────────────────────────────────────────────────────
+
+type TaskRow = typeof tasks.$inferSelect;
+
+/**
+ * One pipeline step. To add a step, append an entry here — checkpointing,
+ * resume-skip, tracing, and SSE events all come from executeStep() for free.
+ *
+ * Contract:
+ * - `run` output must be JSON-serializable (it is persisted as the checkpoint
+ *   and fed to later steps verbatim on resume).
+ * - Read earlier outputs from `ctx[<step name>]`; never from module state,
+ *   because on resume those steps may not have run in this process.
+ * - Anything with external side effects must respect task.dry_run.
+ */
+interface PipelineStep {
+  number: number;
+  name: string;
+  /** Checkpoint input payload — recorded for the audit trail. */
+  input: (task: TaskRow, ctx: Record<string, unknown>) => unknown;
+  run: (task: TaskRow, ctx: Record<string, unknown>) => Promise<unknown>;
+}
+
+const PIPELINE: PipelineStep[] = [
+  {
+    number: 1,
+    name: "memory_retrieval",
+    input: (task) => ({ goal: task.goal }),
+    run: (task) => memoryRetrievalHandler(task.goal, task.team_id),
+  },
+  {
+    number: 2,
+    name: "planner",
+    input: (_task, ctx) => ({ memoryContext: ctx.memory_retrieval }),
+    run: (task) => plannerHandler(task.goal, task.context, task.task_type, task.inject_failure, task.dry_run),
+  },
+  {
+    number: 3,
+    name: "execution",
+    input: (_task, ctx) => ({ planContext: ctx.planner }),
+    run: (task, ctx) => executionHandler(ctx.planner as PlanContext, task.goal, task.inject_failure, task.dry_run),
+  },
+  {
+    number: 4,
+    name: "synthesizer",
+    input: (_task, ctx) => ({ executionOutput: ctx.execution }),
+    run: (task, ctx) => synthesizerHandler(ctx.execution as Record<string, unknown>, task.goal, task.inject_failure),
+  },
+];
+
 // ─── Orchestrator ─────────────────────────────────────────────────────────────
 
 export async function runTaskOrchestrator(taskId: string) {
@@ -399,26 +454,17 @@ export async function runTaskOrchestrator(taskId: string) {
       const doneMap = new Map(done.map((c) => [c.step_number, c]));
       const completedSteps = new Set(doneMap.keys());
 
-      // Pass task to each step to avoid a redundant DB fetch per step (C-1: 5×→1× SELECT)
-      const memoryContext = completedSteps.has(1)
-        ? (doneMap.get(1)?.output_data ?? {})
-        : await executeStep(taskId, 1, "memory_retrieval", { goal: task.goal },
-            () => memoryRetrievalHandler(task.goal, task.team_id), task);
-
-      const planContext = completedSteps.has(2)
-        ? (doneMap.get(2)?.output_data ?? {}) as PlanContext
-        : await executeStep(taskId, 2, "planner", { memoryContext },
-            () => plannerHandler(task.goal, task.context, task.task_type, task.inject_failure, task.dry_run), task) as PlanContext;
-
-      const executionOutput = completedSteps.has(3)
-        ? (doneMap.get(3)?.output_data ?? {}) as Record<string, unknown>
-        : await executeStep(taskId, 3, "execution", { planContext },
-            () => executionHandler(planContext, task.goal, task.inject_failure, task.dry_run), task) as Record<string, unknown>;
-
-      const synthOutput = completedSteps.has(4)
-        ? (doneMap.get(4)?.output_data ?? {}) as SynthOutput
-        : await executeStep(taskId, 4, "synthesizer", { executionOutput },
-            () => synthesizerHandler(executionOutput, task.goal, task.inject_failure), task) as SynthOutput;
+      // Walk the pipeline: completed steps are loaded from their checkpoints
+      // (never re-run — that's the resume guarantee), pending steps execute.
+      // The preloaded task is passed through to avoid a redundant SELECT per step.
+      const ctx: Record<string, unknown> = {};
+      for (const step of PIPELINE) {
+        ctx[step.name] = completedSteps.has(step.number)
+          ? (doneMap.get(step.number)?.output_data ?? {})
+          : await executeStep(taskId, step.number, step.name, step.input(task, ctx),
+              () => step.run(task, ctx), task);
+      }
+      const synthOutput = ctx.synthesizer as SynthOutput;
 
       await db.update(tasks)
         .set({ status: "completed", final_output: JSON.stringify(synthOutput, null, 2), updated_at: new Date() })
@@ -463,7 +509,7 @@ export async function recoverStaleTasks() {
   // Only resume tasks touched in the last 24h — restarting after a long outage
   // must not stampede-rerun weeks of abandoned tasks (and their LLM calls).
   const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  const stale = await db.select().from(tasks).where(
+  const stale = await db.select({ task_id: tasks.task_id }).from(tasks).where(
     and(inArray(tasks.status, ["running", "pending"]), gte(tasks.updated_at, dayAgo))
   );
   if (stale.length === 0) return;

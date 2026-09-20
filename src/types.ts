@@ -1,7 +1,8 @@
 export interface Task {
   task_id: string;
   goal: string;
-  context: string;
+  /** Present on the detail endpoint; omitted from list responses (large blob) */
+  context?: string;
   task_type: string;
   user_id: string;
   status: "pending" | "running" | "failed" | "completed";
@@ -13,7 +14,8 @@ export interface Task {
   resume_count: number;
   created_at: string;
   updated_at: string;
-  final_output: string | null;
+  /** Present on the detail endpoint; omitted from list responses (large blob) */
+  final_output?: string | null;
   error: string | null;
   trace_id: string;
 }

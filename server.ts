@@ -48,6 +48,9 @@ import { listMcpTools, closeMcpClient } from "./src/server/mcp.js";
 import { getLLMClient, LLM_MODELS } from "./src/server/llm.js";
 import { authMiddleware } from "./src/server/auth.js";
 import { asyncHandler, errorMiddleware } from "./src/server/http.js";
+import { allowTaskCreation, taskCreationRateLimit } from "./src/server/rateLimit.js";
+import { SimulateSchema, clampGoal, zodMessage } from "./src/server/validation.js";
+import { startRetentionLoop } from "./src/server/retention.js";
 import { parseLLMJson, generateTraceId, toErrorMessage } from "./src/utils/index.js";
 
 import { healthRouter }   from "./src/routes/health.js";
@@ -102,7 +105,13 @@ app.post("/api/slack/events", asyncHandler(async (req, res) => {
   if (event?.type === "message" && !event.bot_id && event.text) {
     const text: string = event.text.trim();
     if (text.startsWith("!incident ") || text.startsWith("<@")) {
-      const goal = text.replace("!incident ", "").replace(/<@[^>]+>/g, "").trim();
+      // Rate-limit per channel; respond silently rather than 429 so Slack doesn't retry
+      if (!allowTaskCreation(`slack:${event.channel}`)) {
+        logger.warn({ channel: event.channel }, "Slack task creation rate-limited");
+        return;
+      }
+
+      const goal = clampGoal(text.replace("!incident ", "").replace(/<@[^>]+>/g, "").trim());
       const traceId = generateTraceId();
 
       const [newTask] = await db.insert(tasks).values({
@@ -112,6 +121,7 @@ app.post("/api/slack/events", asyncHandler(async (req, res) => {
         user_id: event.user || "slack-user",
         trace_id: traceId,
         inject_failure: false,
+        team_id: process.env.DEFAULT_TEAM_ID || null,
       }).returning();
 
       await sendSlackResponse(event.channel, event.ts, [], `*Task Enqueued:* \`${traceId}\`\nWorking on: ${goal}...`);
@@ -161,9 +171,10 @@ app.get("/api/tools", asyncHandler(async (_req, res) => {
 }));
 
 // Incident simulation (quick LLM call, not checkpointed — for demo purposes)
-app.post("/api/simulate", asyncHandler(async (req, res) => {
-  const { title, description, severity, channel } = req.body;
-  if (!title || !description) return res.status(400).json({ error: "Missing incident title or description" });
+app.post("/api/simulate", taskCreationRateLimit, asyncHandler(async (req, res) => {
+  const parsedBody = SimulateSchema.safeParse(req.body);
+  if (!parsedBody.success) return res.status(400).json({ error: zodMessage(parsedBody.error) });
+  const { title, description, severity, channel } = parsedBody.data;
 
   const ai = getLLMClient();
   const traceId = generateTraceId();
@@ -232,6 +243,7 @@ async function startServer() {
     console.log(`AgentCore running on http://localhost:${config.PORT}`);
     // A transient DB error during recovery must not crash the freshly started server
     await recoverStaleTasks().catch((err) => logger.error({ err }, "Stale task recovery failed"));
+    startRetentionLoop();
   });
 
   // ─── Graceful shutdown ──────────────────────────────────────────────────────

@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { BarChart2, CheckCircle, AlertTriangle, Clock, RefreshCw, TrendingUp } from "lucide-react";
+import { fetchMetrics } from "../lib/api";
 
 interface MetricsSummary {
   total_tasks: number;
@@ -44,8 +45,8 @@ export default function MetricsDashboard() {
   const [error, setError]     = useState("");
 
   useEffect(() => {
-    fetch("/api/metrics")
-      .then(r => r.json())
+    // apiFetch sends the auth header and routes 401s to the login screen
+    fetchMetrics<MetricsData>()
       .then(d => { setData(d); setLoading(false); })
       .catch(() => { setError("Failed to load metrics"); setLoading(false); });
   }, []);

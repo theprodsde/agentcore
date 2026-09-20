@@ -2,107 +2,131 @@ import { Router, type Response } from "express";
 import { eq, desc, and, gte, sql } from "drizzle-orm";
 import { db, tasks, checkpoints } from "../server/db/index.js";
 import { runTaskOrchestrator, taskEventEmitter } from "../server/executor.js";
-import { getLLMClient } from "../server/llm.js";
 import { asyncHandler } from "../server/http.js";
+import { taskCreationRateLimit } from "../server/rateLimit.js";
+import { CreateTaskSchema, zodMessage } from "../server/validation.js";
 import { generateTraceId } from "../utils/index.js";
-import { jaccardSimilarity, editSimilarity } from "../utils/algorithms.js";
+import { incidentSimilarity } from "../utils/algorithms.js";
 
 export const tasksRouter = Router();
 
 // ─── Task creation with deduplication ─────────────────────────────────────────
 
-tasksRouter.post("/tasks", asyncHandler(async (req, res) => {
-  const { goal, context, task_type, user_id, inject_failure, dry_run } = req.body;
-  if (!goal) return res.status(400).json({ error: "Missing goal" });
+const DEDUP_WINDOW_MS  = 10 * 60 * 1000;
+const DEDUP_THRESHOLD  = 0.6;
+const DEDUP_CANDIDATES = 20;
 
-  // Incident deduplication: if a semantically similar task is already running or
-  // pending (created within the last 10 minutes), return it instead of creating
-  // a duplicate investigation.
-  // Uses combined Levenshtein DP (30%) + Jaccard word-overlap (70%) — see src/utils/algorithms.ts
-  if (!inject_failure && !dry_run && getLLMClient()) {
-    try {
-      const tenMinsAgo = new Date(Date.now() - 10 * 60 * 1000);
-      const recentActive = await db.select().from(tasks)
+/** Normalized lock key: identical alert storms serialize on the same advisory lock. */
+function dedupLockKey(goal: string, teamId: string | null): string {
+  const words = goal.toLowerCase().split(/\W+/).filter((w) => w.length > 3).sort();
+  return `${teamId ?? "public"}:${words.join(" ")}`;
+}
+
+type CreateResult =
+  | { kind: "duplicate"; task: typeof tasks.$inferSelect; similarity: number }
+  | { kind: "created"; task: typeof tasks.$inferSelect };
+
+/**
+ * Dedup check + insert inside one transaction holding a pg advisory lock on the
+ * normalized goal, so two identical alerts arriving simultaneously (the classic
+ * alert-storm pattern) cannot both pass the check and create twin investigations.
+ */
+async function dedupAndCreateTask(
+  input: ReturnType<typeof CreateTaskSchema.parse>,
+  teamId: string | null
+): Promise<CreateResult> {
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${dedupLockKey(input.goal, teamId)}))`);
+
+    if (!input.inject_failure && !input.dry_run) {
+      const windowStart = new Date(Date.now() - DEDUP_WINDOW_MS);
+      const recentActive = await tx.select().from(tasks)
         .where(
           and(
-            gte(tasks.created_at, tenMinsAgo),
+            gte(tasks.created_at, windowStart),
             sql`${tasks.status} IN ('pending','running')`,
             // Never correlate across teams — dedup must not reveal another team's task
-            sql`${tasks.team_id} IS NOT DISTINCT FROM ${req.teamId ?? null}`
+            sql`${tasks.team_id} IS NOT DISTINCT FROM ${teamId}`
           )
         )
         .orderBy(desc(tasks.created_at))
-        .limit(20);
+        .limit(DEDUP_CANDIDATES);
 
-      // Pre-compute goal word set once — not inside the loop (E-2 memoization fix)
-      const goalWords = new Set<string>(goal.toLowerCase().split(/\W+/).filter(w => w.length > 3));
-
-      // Request-scoped pair cache — if the same (goal, candidate) pair is evaluated
-      // multiple times (e.g., rapid retries), the DP similarity is not recomputed.
-      // Keys are sorted so (a,b) and (b,a) share the same entry.
-      const pairMemo = new Map<string, number>();
-
-      for (const t of recentActive) {
-        const memoKey = [goal, t.goal].sort().join("\x00");
-        let similarity = pairMemo.get(memoKey);
-
-        if (similarity === undefined) {
-          const tWords = new Set<string>(t.goal.toLowerCase().split(/\W+/).filter(w => w.length > 3));
-          // Three-way blend matching incidentSimilarity() (55% Jaccard + 25% bounded edit + 20% LCS)
-          // Inlined here so we reuse the pre-computed goalWords set
-          const { lcsSimilarity, boundedEditSimilarity } = await import("../utils/algorithms.js");
-          similarity = jaccardSimilarity(goalWords, tWords) * 0.55
-            + boundedEditSimilarity(goal, t.goal) * 0.25
-            + lcsSimilarity(goal, t.goal) * 0.20;
-          pairMemo.set(memoKey, similarity);
-        }
-        if (similarity >= 0.6) {
-          return res.status(200).json({
-            task_id: t.task_id,
-            status: t.status,
-            trace_id: t.trace_id,
-            correlated: true,
-            message: `Similar incident already being investigated (${Math.round(similarity * 100)}% match). Returning existing task.`,
-          });
-        }
+      for (const candidate of recentActive) {
+        const similarity = incidentSimilarity(input.goal, candidate.goal);
+        if (similarity >= DEDUP_THRESHOLD) return { kind: "duplicate", task: candidate, similarity };
       }
-    } catch {
-      // Non-fatal — proceed with task creation if dedup check fails
     }
+
+    const [newTask] = await tx.insert(tasks).values({
+      goal: input.goal,
+      context: input.context,
+      task_type: input.task_type,
+      user_id: input.user_id,
+      trace_id: generateTraceId(),
+      inject_failure: input.inject_failure,
+      dry_run: input.dry_run,
+      team_id: teamId,
+    }).returning();
+
+    return { kind: "created", task: newTask };
+  });
+}
+
+tasksRouter.post("/tasks", taskCreationRateLimit, asyncHandler(async (req, res) => {
+  const parsed = CreateTaskSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: zodMessage(parsed.error) });
+
+  const result = await dedupAndCreateTask(parsed.data, req.teamId ?? null);
+
+  if (result.kind === "duplicate") {
+    return res.status(200).json({
+      task_id: result.task.task_id,
+      status: result.task.status,
+      trace_id: result.task.trace_id,
+      correlated: true,
+      message: `Similar incident already being investigated (${Math.round(result.similarity * 100)}% match). Returning existing task.`,
+    });
   }
 
-  const traceId = generateTraceId();
-  const [newTask] = await db.insert(tasks).values({
-    goal,
-    context: context || "",
-    task_type: task_type || "incident",
-    user_id: user_id || "demo-user-1",
-    trace_id: traceId,
-    inject_failure: inject_failure || false,
-    dry_run: dry_run || false,
-    team_id: req.teamId ?? null,
-  }).returning();
-
-  setImmediate(() => runTaskOrchestrator(newTask.task_id));
+  setImmediate(() => runTaskOrchestrator(result.task.task_id));
   return res.status(201).json({
-    task_id: newTask.task_id,
+    task_id: result.task.task_id,
     status: "pending",
-    trace_id: traceId,
-    dry_run: newTask.dry_run,
+    trace_id: result.task.trace_id,
+    dry_run: result.task.dry_run,
     correlated: false,
   });
 }));
 
 // ─── Task list (paginated) ────────────────────────────────────────────────────
 
+// List responses omit the two large text blobs (final_output, context) —
+// the dashboard only renders summary fields; the detail endpoint returns everything.
+const taskSummaryColumns = {
+  task_id:      tasks.task_id,
+  team_id:      tasks.team_id,
+  goal:         tasks.goal,
+  task_type:    tasks.task_type,
+  user_id:      tasks.user_id,
+  status:       tasks.status,
+  current_step: tasks.current_step,
+  resume_count: tasks.resume_count,
+  error:        tasks.error,
+  trace_id:     tasks.trace_id,
+  dry_run:      tasks.dry_run,
+  created_at:   tasks.created_at,
+  updated_at:   tasks.updated_at,
+} as const;
+
 tasksRouter.get("/tasks", asyncHandler(async (req, res) => {
   const pageSize = Math.min(Math.max(1, Number(req.query.limit) || 50), 200);
   const offset   = Math.max(0, Number(req.query.offset) || 0);
 
   const rows = req.teamId
-    ? await db.select().from(tasks).where(eq(tasks.team_id, req.teamId))
+    ? await db.select(taskSummaryColumns).from(tasks).where(eq(tasks.team_id, req.teamId))
         .orderBy(desc(tasks.created_at)).limit(pageSize).offset(offset)
-    : await db.select().from(tasks)
+    : await db.select(taskSummaryColumns).from(tasks)
         .orderBy(desc(tasks.created_at)).limit(pageSize).offset(offset);
 
   return res.json({ items: rows, limit: pageSize, offset });
@@ -128,7 +152,10 @@ tasksRouter.get("/tasks/:task_id/checkpoints", asyncHandler(async (req, res) => 
   // Checkpoints contain full tool output — same team check as the task itself
   const task = await loadAuthorizedTask(req.params.task_id, req.teamId, res);
   if (!task) return;
-  const rows = await db.select().from(checkpoints).where(eq(checkpoints.task_id, req.params.task_id));
+  // Deterministic order — row order from an unordered SELECT is not guaranteed
+  const rows = await db.select().from(checkpoints)
+    .where(eq(checkpoints.task_id, req.params.task_id))
+    .orderBy(checkpoints.step_number, checkpoints.created_at);
   return res.json({ task_id: req.params.task_id, checkpoints: rows });
 }));
 
@@ -191,7 +218,9 @@ tasksRouter.get("/tasks/:task_id/export.md", asyncHandler(async (req, res) => {
   if (!task) return;
   if (!task.final_output) return res.status(400).json({ error: "Task has no output yet" });
 
-  const cps = await db.select().from(checkpoints).where(eq(checkpoints.task_id, task.task_id));
+  const cps = await db.select().from(checkpoints)
+    .where(eq(checkpoints.task_id, task.task_id))
+    .orderBy(checkpoints.step_number, checkpoints.created_at);
   let synth: Record<string, unknown> = {};
   try { synth = JSON.parse(task.final_output); } catch { /* ignore */ }
 
