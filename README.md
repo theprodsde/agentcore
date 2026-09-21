@@ -14,7 +14,7 @@ The closed alternatives (PagerDuty AIOps, incident.io, Datadog) are expensive an
 
 ## Try it in 90 seconds — no clone, no API keys
 
-![AgentCore demo](.github/assets/mcp-demo.gif)
+![AgentCore UI demo](.github/assets/ui-demo.gif)
 
 Every tool has a deterministic simulation fallback, so the full stack runs with zero credentials. Two commands, using the prebuilt image from GHCR:
 
@@ -147,15 +147,22 @@ The core difference is **state and learning**:
 
 ## How it works
 
-```
-[Slack / Dashboard] → Task Created
-        ↓
-  1. Memory Retrieval   — pgvector cosine similarity against past incidents
-  2. LLM Planner        — selects tools from live manifest with per-tool args
-  3. MCP Tool Execution — search_logs, get_metrics, search_runbook, create_ticket, list_services
-  4. Synthesizer        — derives report from actual tool output, writes to memory
-        ↓
-[Result posted to Slack thread / visible in Dashboard]
+```mermaid
+flowchart LR
+    A["🔔 Alert fires\n(Slack · PagerDuty · Alertmanager · API)"] --> B[Task Created]
+    B --> S1
+
+    subgraph pipeline ["Checkpointed pipeline — each step persists to Postgres"]
+        S1["1 · Memory Retrieval\npgvector cosine similarity\nagainst past incidents"]
+        S2["2 · LLM Planner\nselects tools from live manifest\nwith per-tool args"]
+        S3["3 · MCP Tool Execution\nsearch_logs · get_metrics\nsearch_runbook · create_ticket · list_services"]
+        S4["4 · Synthesizer\nderives report from actual tool output\nwrites resolved incident to memory"]
+        S1 --> S2 --> S3 --> S4
+    end
+
+    S4 --> R["📋 Result\n(Slack thread · Dashboard · export.md)"]
+
+    crash(["💥 crash / timeout"]) -. "resume from\nfailed step only" .-> pipeline
 ```
 
 If any step fails, the task pauses. On resume, completed checkpoints are skipped — no redundant work, no re-running LLM calls.
@@ -350,45 +357,33 @@ The web dashboard shows a login screen automatically when auth is enabled — pa
 
 ## Project structure
 
-```
-server.ts               Express entry point — mounts routes, handles Slack, graceful shutdown
-scripts/
-  run.mjs               CLI — run investigations from the terminal with live streaming
-src/
-  components/
-    ErrorBoundary.tsx   React error boundary — catches render errors, shows fallback UI
-  routes/               Route handlers (one file per domain)
-    auth.ts             POST /api/teams, POST /api/auth/token, POST /api/teams/:id/api-keys
-    health.ts           GET /api/health, GET /api/health/detailed (parallel checks)
-    tasks.ts            CRUD + SSE stream + resume + post-mortem export + incident dedup
-    memory.ts           Memory retrieval + pgvector semantic query (paginated)
-    metrics.ts          GET /api/metrics — 30-day summary, step p95, weekly trend (cached)
-    webhooks.ts         POST /api/webhooks/{pagerduty,opsgenie,alertmanager} (HMAC-verified)
-  server/
-    executor.ts         Orchestrator + step handlers + 0/1 Knapsack tool selection
-    auth.ts             JWT middleware, token signing, API key hashing
-    cache.ts            LRU TTL cache (doubly-linked list + HashMap) for tool results
-    llm.ts              Shared OpenAI client singleton + model constants
-    embeddings.ts       text-embedding-3-small wrapper with LRU memoization
-    mcp.ts              MCP client — spawns tools/server.ts via stdio or connects via SSE
-    telemetry.ts        OTel provider + tracer export
-    logger.ts           Pino logger with trace_id/span_id mixin
-    db/                 Drizzle schema + connection (pgvector, 5 indexes)
-  utils/
-    index.ts            parseLLMJson, generateTraceId, toErrorMessage
-    algorithms.ts       Levenshtein DP, bounded DP, LCS, top-k heap, LRU, Jaccard, Knapsack
-    synthesis.ts        deriveSynthesisFromOutput — pure function, no infrastructure deps
-tools/
-  server.ts             MCP tool server — search_logs, get_metrics, search_runbook, create_ticket, list_services
-  README.md             How to add tools and connect real backends
-tests/
-  unit/
-    algorithms.test.ts  Levenshtein, LCS, Knapsack, top-k, Jaccard, LRU, similarity
-    auth.test.ts        JWT, API key hashing, middleware
-    executor.test.ts    deriveSynthesisFromOutput, planner/synthesizer output contracts
-    slack.test.ts       Slack request signature verification (HMAC v0, replay protection)
-    tools.test.ts       parseRange, filter logic, metric simulation, output shapes
-    utils.test.ts       parseLLMJson, generateTraceId, toErrorMessage
+```mermaid
+mindmap
+  root((AgentCore))
+    Entry
+      server.ts<br/>Express · Slack · graceful shutdown
+      scripts/run.mjs<br/>CLI with live streaming
+    src/routes
+      tasks.ts<br/>CRUD · SSE · resume · dedup · export
+      auth.ts<br/>teams · token exchange · API keys
+      memory.ts<br/>pgvector semantic search
+      metrics.ts<br/>30-day summary · step p95
+      webhooks.ts<br/>PagerDuty · OpsGenie · Alertmanager
+      health.ts<br/>liveness · readiness
+    src/server
+      executor.ts<br/>orchestrator · Knapsack tool selection
+      auth.ts<br/>JWT · API key hashing
+      mcp.ts<br/>stdio spawn · SSE client
+      cache.ts<br/>LRU TTL · doubly-linked HashMap
+      embeddings.ts<br/>text-embedding-3-small · LRU memo
+      db/<br/>Drizzle schema · pgvector · 5 indexes
+    src/utils
+      algorithms.ts<br/>Levenshtein · LCS · Knapsack · Jaccard
+      synthesis.ts<br/>pure deriveSynthesisFromOutput
+    tools
+      server.ts<br/>MCP tool server · 5 built-in tools
+    tests/unit
+      algorithms · auth · executor<br/>slack · tools · utils
 ```
 
 ## Development commands
