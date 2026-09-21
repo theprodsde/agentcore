@@ -1,0 +1,45 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(DATABASE_URL=postgres://agentcore:agentcore@localhost:5433/agentcore npx drizzle-kit push)",
+      "Bash(DATABASE_URL=postgres://agentcore:agentcore@localhost:5433/agentcore npm run dev)",
+      "Bash(lsof -i:3000 -sTCP:LISTEN)",
+      "Bash(lsof -i:3000)",
+      "Bash(PORT=3001 DATABASE_URL=postgres://agentcore:agentcore@localhost:5433/agentcore npm run dev)",
+      "Bash(open -a \"Docker\")",
+      "Bash(curl -s http://localhost:3001/api/health)",
+      "Bash(curl -s http://localhost:3001/api/tasks/b062b1a9-0169-4360-8d39-49a7b9e63602/checkpoints)",
+      "Bash(curl -s http://localhost:3001/api/memory)",
+      "Bash(awk '{print $3}')",
+      "Bash(git check-ignore *)",
+      "Bash(node scripts/migrate.mjs)",
+      "Bash(curl -s -m 5 http://localhost:3999/api/health)",
+      "Bash(NODE_ENV=production PORT=3999 JWT_SECRET=prod-test-secret node dist/server.cjs)",
+      "Bash(curl -s -m 10 http://localhost:3999/api/health/detailed)",
+      "Bash(curl -s -m 5 http://localhost:3999/api/tasks/25f1d934-0bbc-4abd-966e-4d3e3f71fc58 -H 'Authorization: Bearer __CMDSUB_OUTPUT__')",
+      "Bash(node -e \"let d='';process.stdin.on\\('data',c=>d+=c\\).on\\('end',\\(\\)=>{const t=JSON.parse\\(d\\);console.log\\('status:',t.status,'| step:',JSON.stringify\\(t.current_step\\),'| error:',t.error\\)}\\)\")",
+      "Bash(tee /tmp/postmortem.md)",
+      "Bash(node test-mcp-tmp.mjs)",
+      "Bash(node -e \"console.log\\(process.version\\)\")",
+      "Bash(TEST_DATABASE_URL=postgres://agentcore:agentcore@localhost:5433/agentcore npm run test:integration)",
+      "Bash(TEST_DATABASE_URL=postgres://agentcore:agentcore@localhost:5434/agentcore npm run test:integration)",
+      "Bash(DATABASE_URL=postgres://agentcore:agentcore@localhost:5434/agentcore node scripts/migrate.mjs)",
+      "Bash(env -u OPENAI_API_KEY DATABASE_URL=postgres://agentcore:agentcore@localhost:5434/agentcore NODE_ENV=production PORT=3999 JWT_SECRET=smoke-secret RATE_LIMIT_RPM=3 node dist/server.cjs)",
+      "Bash(curl -s http://localhost:3999/api/auth/status)",
+      "Bash(npm i *)",
+      "Bash(DATABASE_URL=postgres://agentcore:agentcore@localhost:5434/agentcore NODE_ENV=production PORT=3000 JWT_SECRET=ui-test-secret node dist/server.cjs)",
+      "Bash(curl -s http://localhost:3000/api/auth/status)",
+      "Bash(AGENTCORE_IMAGE=agentcore:local docker compose -f docker-compose.demo.yml -p agentcore-demo up -d)",
+      "Bash(curl -s -m 5 http://localhost:3000/api/health/detailed)",
+      "Bash(curl -s -m 10 -X POST http://localhost:3000/api/tasks -H \"Content-Type: application/json\" -d '{\"goal\":\"payments-service p99 latency at 4s after deploy\"}')",
+      "Bash(echo \"build exit: $?\")",
+      "Bash(OPENAI_API_KEY=\"\" DATABASE_URL=postgres://agentcore:agentcore@localhost:5434/agentcore NODE_ENV=production PORT=3999 node dist/server.cjs)",
+      "Bash(AGENTCORE_URL=http://localhost:3999 node scripts/eval.mjs --strict)",
+      "Bash(echo \"eval exit: $?\")",
+      "Bash(sed -i '' 's/\"threshold breach\"/\"threshold breach:\"/g' evals/golden-incidents.json)"
+    ],
+    "additionalDirectories": [
+      "/Users/karangehlod/theprodsde/theprodsde.github.io/content/blog"
+    ]
+  }
+}

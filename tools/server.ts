@@ -19,6 +19,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z, ZodError } from "zod";
+import { simulateLogs, simulateMetrics, simulateServices, parseRange } from "./simulation.js";
 
 // ─── Zod schemas for tool arg validation (G-2) ───────────────────────────────
 const SearchLogsSchema = z.object({
@@ -170,55 +171,17 @@ async function searchLogs(args: SearchLogsArgs) {
     return await queryLoki(service, query, severity, limit, time_range);
   }
 
-  // Simulation: produce realistic log lines keyed on query keywords
-  const now = Date.now();
-  const keywords = query.toLowerCase();
-  const isDeadlock = keywords.includes("deadlock") || keywords.includes("lock") || keywords.includes("timeout");
-  const isOom      = keywords.includes("memory") || keywords.includes("oom") || keywords.includes("heap");
-  const isLatency  = keywords.includes("latency") || keywords.includes("slow") || keywords.includes("response");
-
-  const templates = isDeadlock
-    ? [
-        `[ERROR] ${service}: ER_LOCK_WAIT_TIMEOUT — transaction ${rnd("tx")} waited >30s for row lock on table orders`,
-        `[ERROR] ${service}: deadlock detected between workers ${rnd("w")} and ${rnd("w")} on connection pool slot 14`,
-        `[WARN]  ${service}: lock wait threshold breached 5 times in last 60s — pool utilisation 94%`,
-        `[ERROR] ${service}: SQLSTATE[40P01]: deadlock detected, query aborted — rolling back transaction`,
-        `[INFO]  ${service}: auto-retry attempt 3/3 on transaction ${rnd("tx")} — still failing`,
-      ]
-    : isOom
-    ? [
-        `[ERROR] ${service}: FATAL: JavaScript heap out of memory — rss 3.1GB, heapUsed 2.9GB`,
-        `[WARN]  ${service}: GC overhead limit exceeded — 98% of CPU time spent in GC over 30s window`,
-        `[ERROR] ${service}: process killed by OOMKiller — cgroup memory limit 3GB exceeded`,
-        `[WARN]  ${service}: memory allocation failed for buffer size 512MB — retrying with reduced batch`,
-      ]
-    : isLatency
-    ? [
-        `[WARN]  ${service}: p99 latency 4230ms — SLO threshold 1000ms`,
-        `[WARN]  ${service}: downstream call to postgres-primary timed out after 3000ms`,
-        `[ERROR] ${service}: circuit breaker OPEN after 10 consecutive 504s to dependency inventory-service`,
-        `[INFO]  ${service}: slow query detected — SELECT on orders table took 2840ms (missing index?)`,
-      ]
-    : [
-        `[ERROR] ${service}: unexpected error in request handler — ${query}`,
-        `[WARN]  ${service}: retrying failed operation — attempt 2/3`,
-        `[ERROR] ${service}: dependency health check failed`,
-      ];
-
-  const entries = templates.slice(0, Math.min(limit, templates.length)).map((msg, i) => ({
-    timestamp: new Date(now - (i * 12000)).toISOString(),
-    severity: msg.startsWith("[ERROR]") ? "error" : msg.startsWith("[WARN]") ? "warn" : "info",
-    service,
-    message: msg.replace(/^\[.*?\]\s+\S+:\s+/, ""),
-    trace_id: rnd("tr"),
-  }));
-
+  // Simulation: log content is derived from the world model's state for this
+  // service (see tools/simulation.ts) — not from the query. Healthy or unknown
+  // services return routine noise only, so "found nothing" is a possible outcome.
+  const { total_matched, entries, note } = simulateLogs(service, query, limit);
   return {
     backend: "simulation",
     service,
     query,
     time_range,
-    total_matched: entries.length,
+    total_matched,
+    ...(note ? { note } : {}),
     entries,
   };
 }
@@ -260,33 +223,16 @@ async function getMetrics(args: GetMetricsArgs) {
     return await queryPrometheus(service, metric, time_range);
   }
 
-  const key = metric.toLowerCase();
-  const isCpu     = key.includes("cpu");
-  const isLatency = key.includes("latency") || key.includes("p99") || key.includes("p95");
-  const isError   = key.includes("error") || key.includes("rate");
-  const isMem     = key.includes("mem") || key.includes("heap");
-
-  const current = isCpu ? 87.4 : isLatency ? 4230 : isError ? 12.3 : isMem ? 89.1 : 42.0;
-  const unit    = isCpu ? "%" : isLatency ? "ms" : isError ? "req/s errors" : isMem ? "%" : "req/s";
-  const trend   = "rising";
-  const threshold = isCpu ? 80 : isLatency ? 1000 : isError ? 5 : isMem ? 85 : null;
-
-  const now = Date.now();
-  const datapoints = Array.from({ length: 8 }, (_, i) => ({
-    timestamp: new Date(now - (7 - i) * (parseRange(time_range) / 8) * 1000).toISOString(),
-    value: +(current * (0.6 + (i / 7) * 0.5)).toFixed(2),
-  }));
-
+  // Simulation: values come from the world model — a healthy service reports
+  // healthy numbers even if the caller expected a breach.
+  const { threshold, ...sim } = simulateMetrics(service, metric, parseRange(time_range));
   return {
     backend: "simulation",
     service,
     metric,
     time_range,
-    current,
-    unit,
-    trend,
-    ...(threshold !== null && { threshold, threshold_breached: current > threshold }),
-    datapoints,
+    ...sim,
+    ...(threshold !== null ? { threshold } : {}),
   };
 }
 
@@ -385,20 +331,7 @@ interface ListServicesArgs {
 
 async function listServices(args: ListServicesArgs) {
   const { filter_status = "all" } = args;
-
-  const services = [
-    { name: "payments-service",   status: "degraded", latency_p99_ms: 4230, error_rate: 12.3, replicas: "2/3", last_deploy: "2h ago" },
-    { name: "inventory-service",  status: "degraded", latency_p99_ms: 890,  error_rate: 3.1,  replicas: "3/3", last_deploy: "4h ago" },
-    { name: "auth-service",       status: "healthy",  latency_p99_ms: 120,  error_rate: 0.1,  replicas: "3/3", last_deploy: "1d ago" },
-    { name: "notification-service", status: "healthy", latency_p99_ms: 45,  error_rate: 0.0,  replicas: "2/2", last_deploy: "3d ago" },
-    { name: "postgres-primary",   status: "degraded", latency_p99_ms: 3100, error_rate: 8.7,  replicas: "1/1", last_deploy: "n/a" },
-    { name: "redis-cache",        status: "healthy",  latency_p99_ms: 2,    error_rate: 0.0,  replicas: "1/1", last_deploy: "n/a" },
-    { name: "api-gateway",        status: "healthy",  latency_p99_ms: 210,  error_rate: 0.4,  replicas: "3/3", last_deploy: "6h ago" },
-  ];
-
-  const filtered = filter_status === "all"
-    ? services
-    : services.filter((s) => s.status === filter_status);
+  const filtered = simulateServices(filter_status);
 
   return {
     backend: "simulation",
@@ -494,19 +427,6 @@ async function searchRunbook(args: SearchRunbookArgs) {
   });
 
   return { backend: "simulation", query, service: svc, results: runbooks };
-}
-
-// ─── helpers ─────────────────────────────────────────────────────────────────
-
-function rnd(prefix: string) {
-  return `${prefix}-${Math.random().toString(36).substring(2, 9)}`;
-}
-
-function parseRange(range: string): number {
-  const match = range.match(/^(\d+)(m|h|d)$/);
-  if (!match) return 3600;
-  const [, n, unit] = match;
-  return parseInt(n) * (unit === "m" ? 60 : unit === "h" ? 3600 : 86400);
 }
 
 // ─── Start ────────────────────────────────────────────────────────────────────

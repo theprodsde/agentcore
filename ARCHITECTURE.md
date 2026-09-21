@@ -112,6 +112,16 @@ without touching business logic:
 - Tool calls run in parallel under a per-call timeout; identical concurrent
   incidents serialize on a Postgres advisory lock keyed by normalized goal.
 
+## Quality gate: the golden-incident eval
+
+Demo data is a **world model** ([tools/simulation.ts](tools/simulation.ts)): service
+state determines log/metric output, never the caller's query. On every push CI runs
+[evals/golden-incidents.json](evals/golden-incidents.json) through the full pipeline
+(deterministic without an LLM key) and fails if a report misses the true cause or
+fabricates a finding — including an anti-circularity case (alert claims the wrong
+symptom) and false alarms on healthy services. `npm run eval` runs it against any
+live instance; with an LLM key it benchmarks real planner/synthesizer quality.
+
 ## Invariants (PRs violating these get blocked)
 
 1. Tenant isolation on every task/memory read.

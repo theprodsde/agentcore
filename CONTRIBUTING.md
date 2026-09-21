@@ -49,7 +49,11 @@ Tools live in [tools/server.ts](tools/server.ts). The pattern for every tool:
 2. Add the tool definition (name, description, JSON schema) to the `ListTools` handler.
 3. Write the handler: **check for the real backend's env var first, fall back to a
    deterministic simulation** so the tool works in demo mode. See `searchLogs`
-   (Loki) or `createTicket` (Linear) for the shape to copy.
+   (Loki) or `createTicket` (Linear) for the shape to copy. Simulations derive
+   output from the world model in [tools/simulation.ts](tools/simulation.ts) —
+   never from the caller's query (that would make every investigation trivially
+   "correct"). If you extend the world (new service, new failure mode), add a
+   matching scenario to [evals/golden-incidents.json](evals/golden-incidents.json).
 4. Register it in `TOOL_REGISTRY`. No other files need to change — the LLM planner
    picks up the new manifest automatically.
 5. Add unit tests for the pure parts (arg parsing, output shape) in

@@ -139,7 +139,7 @@ The core difference is **state and learning**:
 | Team size | Expected outcome |
 |---|---|
 | 3–10 engineers | Eliminates the "everyone stops to help the on-call" pattern for routine incidents. One person + AgentCore handles initial triage |
-| 10–50 engineers | Reduces mean time to understand (MTTU) from 20–40 min to 2–5 min for known incident classes. Frees senior engineers from repetitive triage |
+| 10–50 engineers | Designed to cut mean time to understand (MTTU) for known incident classes from tens of minutes to a few — validate on your own incidents with the [eval harness](evals/golden-incidents.json). Frees senior engineers from repetitive triage |
 | 50+ engineers, multiple teams | Multi-tenant deployment lets each team own their memory and tasks independently. Platform team can build shared tool servers that all teams consume |
 | Post-incident compliance | Full checkpoint + trace record per incident satisfies audit requirements in finance, healthcare, and regulated industries |
 
@@ -400,7 +400,14 @@ npm run test:watch   # Watch mode
 npm run test:coverage  # Coverage report
 npm run db:push      # Push schema to DB (creates/alters tables)
 npm run db:studio    # Open Drizzle Studio
+npm run eval         # Score triage quality against the golden incidents (needs a running server)
 ```
+
+## Triage quality is evaluated, not assumed
+
+The demo data is an adversarial **world model** ([tools/simulation.ts](tools/simulation.ts)): each simulated service has a fixed state (healthy, or degraded with a specific failure mode), and log/metric output derives from *that state* — never from your query. Ask about a deadlock on a service that actually has a latency regression and the report describes the latency regression. Ask about a healthy service and the honest answer is "no clear anomaly found."
+
+CI runs a [golden-incident eval](evals/golden-incidents.json) on every push: true-positive scenarios, false alarms on healthy services, an unknown-service case, and an anti-circularity case where the alert's claimed symptom is wrong. Reports are scored for identifying the real cause and — just as important — for **not fabricating findings** the data doesn't support. Run it against your own deployment with `npm run eval`, or point the scenarios at real backends to benchmark LLM/prompt changes.
 
 ## Adding a new MCP tool
 

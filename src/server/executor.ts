@@ -10,6 +10,7 @@ import { tracer, SpanStatusCode } from "./telemetry";
 import { parseLLMJson, toErrorMessage } from "../utils/index";
 import { deriveSynthesisFromOutput, type SynthOutput } from "../utils/synthesis";
 import { getCached, setCached, toolCacheKey } from "./cache";
+import { simulateLogs, simulateMetrics, simulateServices } from "../../tools/simulation";
 import { topK, selectOptimalTools, type ToolOption } from "../utils/algorithms";
 export { deriveSynthesisFromOutput } from "../utils/synthesis";
 
@@ -317,27 +318,40 @@ export async function executionHandler(
   };
 }
 
-function buildFallbackToolResult(tool: string, args: Record<string, unknown>, service: string): unknown {
+/**
+ * MCP-unavailable fallback. Uses the same simulation world model as the tools
+ * server (state-derived output, never query-echo) and wraps payloads in MCP
+ * content shape so the synthesizer treats them identically to real tool output.
+ */
+function buildFallbackToolResult(tool: string, args: Record<string, unknown>, defaultService: string): unknown {
   const now = new Date().toISOString();
-  switch (tool) {
-    case "search_logs":
-      return { backend: "fallback", service, query: args.query, total_matched: 2, entries: [
-        { timestamp: now, severity: "error", service, message: `Repeated failures detected in ${service}`, trace_id: `tr-${crypto.randomBytes(4).toString("hex")}` },
-        { timestamp: now, severity: "warn",  service, message: `High latency observed in ${service} request path`, trace_id: `tr-${crypto.randomBytes(4).toString("hex")}` },
-      ]};
-    case "get_metrics":
-      return { backend: "fallback", service, metric: args.metric, current: 87.4, unit: "%", trend: "rising", threshold: 80, threshold_breached: true };
-    case "search_runbook":
-      return { backend: "fallback", query: args.query, results: [
-        { title: `Runbook: ${service} incident response`, url: "#", excerpt: `Standard procedure for ${service} incidents: 1. Check logs 2. Review metrics 3. Escalate if SLO breached.` },
-      ]};
-    case "create_ticket":
-      return { backend: "fallback", ticket_id: `INC-${Math.floor(1000 + Math.random() * 9000)}`, title: args.title, status: "open", created_at: now };
-    case "list_services":
-      return { backend: "fallback", services: [{ name: service, status: "degraded" }] };
-    default:
-      return { backend: "fallback", result: `Tool ${tool} executed` };
-  }
+  const service = String(args.service ?? defaultService);
+
+  const payload = (() => {
+    switch (tool) {
+      case "search_logs": {
+        const { total_matched, entries, note } = simulateLogs(service, String(args.query ?? ""), 10);
+        return { backend: "fallback", service, query: args.query, total_matched, ...(note ? { note } : {}), entries };
+      }
+      case "get_metrics": {
+        const metric = String(args.metric ?? "latency_p99");
+        const { threshold, ...sim } = simulateMetrics(service, metric, 3600);
+        return { backend: "fallback", service, metric, ...sim, ...(threshold !== null ? { threshold } : {}) };
+      }
+      case "search_runbook":
+        return { backend: "fallback", query: args.query, results: [
+          { title: `Runbook: ${service} incident response`, url: "#", excerpt: `Standard procedure for ${service} incidents: 1. Check logs 2. Review metrics 3. Escalate if SLO breached.` },
+        ]};
+      case "create_ticket":
+        return { backend: "fallback", ticket_id: `INC-${Math.floor(1000 + Math.random() * 9000)}`, title: args.title, status: "open", created_at: now };
+      case "list_services":
+        return { backend: "fallback", total: simulateServices("all").length, services: simulateServices("all"), checked_at: now };
+      default:
+        return { backend: "fallback", result: `Tool ${tool} executed` };
+    }
+  })();
+
+  return { content: [{ type: "text", text: JSON.stringify(payload) }] };
 }
 
 export async function synthesizerHandler(

@@ -27,7 +27,8 @@ export function deriveSynthesisFromOutput(
 ): SynthOutput {
   let topError = "";
   let affectedService = "";
-  let ticketId = `INC-${Math.floor(1000 + Math.random() * 9000)}`;
+  // Never fabricate a ticket reference — empty means "no ticket was created"
+  let ticketId = "";
   let thresholdBreach = "";
   const nextActions: string[] = [];
 
@@ -41,9 +42,9 @@ export function deriveSynthesisFromOutput(
 
     if (key.includes("search_logs")) {
       const entries = parsed.entries as { message: string; severity: string }[] | undefined;
-      if (entries?.length) {
-        topError = entries.find((e) => e.severity === "error")?.message ?? entries[0].message ?? "";
-      }
+      // Only error-severity entries count as signal — routine info/warn noise
+      // must not be promoted into an incident summary
+      topError = entries?.find((e) => e.severity === "error")?.message ?? topError;
       affectedService = (parsed.service as string) ?? affectedService;
     }
 
@@ -60,6 +61,24 @@ export function deriveSynthesisFromOutput(
     }
   }
 
+  // No error-level logs and no metric breach: say so, instead of inventing a
+  // cause. "The data doesn't support the alert" is a valid triage outcome.
+  if (!topError && !thresholdBreach) {
+    return {
+      summary: `No clear anomaly found for: ${goal.slice(0, 80)}. Logs show routine activity and no metric thresholds are breached.`,
+      probable_cause:
+        "No error-level log entries or metric threshold breaches were found — the reported symptom may be transient, upstream, or outside the queried scope. Root cause requires further investigation.",
+      affected_systems: affectedService ? [affectedService] : ["unknown-service"],
+      next_actions: [
+        "Broaden the log search window and include warn-level entries",
+        "Check upstream dependencies and recent deploys for correlation",
+        "Verify the alert rule itself is not misconfigured or flapping",
+        "Update runbook with incident details",
+      ],
+      ticket_id: ticketId,
+    };
+  }
+
   if (nextActions.length === 0) {
     nextActions.push("Review logs for root cause", "Check metrics dashboard");
   }
@@ -71,7 +90,7 @@ export function deriveSynthesisFromOutput(
 
   const probable_cause = thresholdBreach
     ? `Threshold breach: ${thresholdBreach}`
-    : topError || "Root cause requires further investigation";
+    : topError;
 
   return {
     summary,

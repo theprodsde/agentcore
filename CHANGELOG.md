@@ -31,6 +31,9 @@ First tagged release.
 - `ARCHITECTURE.md`: system map, extension points (tools, pipeline steps, alert sources, routes, MCP), scaling seams for planned features, and hard invariants.
 
 ### Changed
+- **Simulation is now an adversarial world model** (`tools/simulation.ts`): each simulated service has a fixed health state and failure mode, and log/metric output derives from that state instead of echoing the caller's query. Healthy and unknown services return routine noise only — "found nothing" is a possible outcome, and signal is interleaved with noise. The MCP-unavailable fallback in the executor uses the same world model.
+- The synthesizer reports **"no clear anomaly found"** when there are no error-level logs and no metric breaches, instead of inventing a cause; it also no longer fabricates a ticket ID when no ticket was created.
+- **Golden-incident eval harness** (`npm run eval`, `evals/golden-incidents.json`): scores pipeline reports for identifying the true cause and for not fabricating findings — including anti-circularity and false-alarm scenarios. Runs deterministically in CI as a regression gate.
 - The orchestrator pipeline is now a declarative step array — adding a step is one `PIPELINE` entry; checkpointing, resume, tracing, and SSE are inherited automatically.
 - List endpoints return summary columns only: memory responses no longer ship ~6 KB embedding vectors per row, task lists no longer ship `final_output`/`context` blobs; memory retrieval inside the executor also stops fetching vectors. Checkpoint timelines are now deterministically ordered.
 
