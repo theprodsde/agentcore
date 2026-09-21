@@ -4,6 +4,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-24-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![Roadmap](https://img.shields.io/badge/Roadmap-GitHub%20Projects-0075ca)](https://github.com/users/theprodsde/projects/1)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-theprodsde-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://www.buymeacoffee.com/theprodsde)
 
 **Self-hosted, stack-agnostic AI incident triage — with checkpointed resume and episodic memory.**
