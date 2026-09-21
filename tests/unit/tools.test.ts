@@ -1,18 +1,17 @@
-import { describe, it, expect, beforeEach } from "vitest";
+/**
+ * Tests the simulation world model directly (tools/simulation.ts is pure).
+ * The key property under test: output is derived from the simulated system's
+ * STATE, not from the caller's query — investigations can find nothing, or
+ * find something different from what was asked about.
+ */
+import { describe, it, expect } from "vitest";
+import {
+  SERVICE_WORLD, getServiceState, simulateLogs, simulateMetrics, simulateServices, parseRange,
+} from "../../tools/simulation";
 
-// Import the private helpers by testing the module's exported behaviour
-// Tools server functions are not individually exported, so we test them
-// through the well-defined boundary: the parsed output shapes.
-// For parseRange and listServices logic we extract the patterns here.
+const NOW = 1_758_400_000_000; // fixed clock for deterministic assertions
 
-// ─── parseRange (replicated to test in isolation) ─────────────────────────────
-
-function parseRange(range: string): number {
-  const match = range.match(/^(\d+)(m|h|d)$/);
-  if (!match) return 3600;
-  const [, n, unit] = match;
-  return parseInt(n) * (unit === "m" ? 60 : unit === "h" ? 3600 : 86400);
-}
+// ─── parseRange ───────────────────────────────────────────────────────────────
 
 describe("parseRange", () => {
   it("parses minutes correctly", () => expect(parseRange("15m")).toBe(900));
@@ -23,127 +22,134 @@ describe("parseRange", () => {
   it("handles multi-digit numbers",     () => expect(parseRange("30m")).toBe(1800));
 });
 
-// ─── listServices filter logic (isolated) ────────────────────────────────────
+// ─── World model ──────────────────────────────────────────────────────────────
 
-type ServiceStatus = "healthy" | "degraded" | "down";
-interface Service { name: string; status: ServiceStatus }
+describe("service world model", () => {
+  it("every degraded service has a failure mode", () => {
+    for (const s of SERVICE_WORLD.filter((s) => s.status === "degraded")) {
+      expect(s.failureMode, `${s.name} missing failureMode`).toBeTruthy();
+    }
+  });
 
-const SERVICES: Service[] = [
-  { name: "payments-service",  status: "degraded" },
-  { name: "auth-service",      status: "healthy" },
-  { name: "postgres-primary",  status: "degraded" },
-  { name: "redis-cache",       status: "healthy" },
-];
+  it("looks up services by exact name", () => {
+    expect(getServiceState("payments-service")?.failureMode).toBe("latency");
+    expect(getServiceState("ghost-service")).toBeUndefined();
+  });
+});
 
-function filterServices(services: Service[], filter: string): Service[] {
-  return filter === "all" ? services : services.filter((s) => s.status === filter);
-}
-
-describe("listServices filter", () => {
+describe("simulateServices filter", () => {
   it("returns all services when filter is 'all'", () => {
-    expect(filterServices(SERVICES, "all")).toHaveLength(4);
+    expect(simulateServices("all")).toHaveLength(SERVICE_WORLD.length);
   });
 
   it("returns only degraded services", () => {
-    const result = filterServices(SERVICES, "degraded");
-    expect(result).toHaveLength(2);
+    const result = simulateServices("degraded");
+    expect(result.length).toBeGreaterThan(0);
     expect(result.every((s) => s.status === "degraded")).toBe(true);
   });
 
-  it("returns only healthy services", () => {
-    const result = filterServices(SERVICES, "healthy");
-    expect(result).toHaveLength(2);
-    expect(result.every((s) => s.status === "healthy")).toBe(true);
-  });
-
   it("returns empty array for 'down' when no down services exist (not a silent false-positive)", () => {
-    const result = filterServices(SERVICES, "down");
-    expect(result).toHaveLength(0);
-  });
-
-  it("returns correct services for 'down' when a down service exists", () => {
-    const withDown: Service[] = [...SERVICES, { name: "broken-svc", status: "down" }];
-    const result = filterServices(withDown, "down");
-    expect(result).toHaveLength(1);
-    expect(result[0].name).toBe("broken-svc");
+    expect(simulateServices("down")).toHaveLength(0);
   });
 });
 
-// ─── searchLogs output shape ─────────────────────────────────────────────────
+// ─── Log simulation ───────────────────────────────────────────────────────────
 
-describe("search_logs simulation output shape", () => {
-  function buildLogEntry(service: string, severity: string, message: string) {
-    return { timestamp: new Date().toISOString(), severity, service, message, trace_id: "tr-test" };
-  }
-
-  it("entry has required fields", () => {
-    const entry = buildLogEntry("payments-service", "error", "deadlock");
-    expect(entry).toHaveProperty("timestamp");
-    expect(entry).toHaveProperty("severity");
-    expect(entry).toHaveProperty("service");
-    expect(entry).toHaveProperty("message");
-    expect(entry).toHaveProperty("trace_id");
+describe("simulateLogs", () => {
+  it("entries have the required fields", () => {
+    const { entries } = simulateLogs("payments-service", "latency", 10, NOW);
+    for (const e of entries) {
+      expect(e).toHaveProperty("timestamp");
+      expect(e).toHaveProperty("severity");
+      expect(e).toHaveProperty("service");
+      expect(e).toHaveProperty("message");
+      expect(e).toHaveProperty("trace_id");
+    }
   });
 
-  it("OOM keywords produce heap-related log messages", () => {
-    const keywords = "OOM heap out of memory";
-    const isOom = keywords.includes("memory") || keywords.includes("oom") || keywords.includes("heap");
-    expect(isOom).toBe(true);
+  it("is anti-circular: querying 'deadlock' on a latency-degraded service returns latency signal, not deadlock", () => {
+    const { entries, signal } = simulateLogs("payments-service", "database deadlock", 20, NOW);
+    expect(signal).toBe(true);
+    const text = entries.map((e) => e.message).join(" ");
+    expect(text).not.toMatch(/deadlock/i);
+    expect(text).toMatch(/latency|circuit breaker|timed out/i);
   });
 
-  it("deadlock keywords route to lock-related messages", () => {
-    const query = "deadlock timeout ER_LOCK_WAIT_TIMEOUT";
-    const isDeadlock = query.includes("deadlock") || query.includes("lock") || query.includes("timeout");
-    expect(isDeadlock).toBe(true);
+  it("degraded services mix signal with routine noise", () => {
+    const { entries } = simulateLogs("orders-service", "anything", 20, NOW);
+    const severities = new Set(entries.map((e) => e.severity));
+    expect(severities.has("error")).toBe(true);
+    expect(severities.has("info")).toBe(true); // noise is present too
+  });
+
+  it("healthy services return no error-level entries and set a note", () => {
+    const { entries, signal, note } = simulateLogs("auth-service", "OOM heap out of memory", 20, NOW);
+    expect(signal).toBe(false);
+    expect(note).toContain("routine activity");
+    expect(entries.some((e) => e.severity === "error")).toBe(false);
+  });
+
+  it("unknown services return no signal instead of fabricating one", () => {
+    const { signal, entries } = simulateLogs("ghost-service", "everything is on fire", 20, NOW);
+    expect(signal).toBe(false);
+    expect(entries.some((e) => e.severity === "error")).toBe(false);
+  });
+
+  it("is deterministic: same input produces identical output", () => {
+    const a = simulateLogs("orders-service", "deadlock", 10, NOW);
+    const b = simulateLogs("orders-service", "deadlock", 10, NOW);
+    expect(a).toEqual(b);
+  });
+
+  it("respects the limit", () => {
+    expect(simulateLogs("payments-service", "q", 2, NOW).entries).toHaveLength(2);
   });
 });
 
-// ─── get_metrics simulation output shape ─────────────────────────────────────
+// ─── Metric simulation ────────────────────────────────────────────────────────
 
-describe("get_metrics simulation output shape", () => {
-  function simulateMetrics(metric: string) {
-    const key = metric.toLowerCase();
-    const isCpu     = key.includes("cpu");
-    const isLatency = key.includes("latency") || key.includes("p99");
-    const isError   = key.includes("error") || key.includes("rate");
-    const isMem     = key.includes("mem") || key.includes("heap");
-
-    const current   = isCpu ? 87.4 : isLatency ? 4230 : isError ? 12.3 : isMem ? 89.1 : 42.0;
-    const unit      = isCpu ? "%" : isLatency ? "ms" : isError ? "req/s errors" : isMem ? "%" : "req/s";
-    const threshold = isCpu ? 80 : isLatency ? 1000 : isError ? 5 : isMem ? 85 : null;
-    return { current, unit, threshold, threshold_breached: threshold !== null && current > threshold };
-  }
-
-  it("cpu_usage returns percentage with correct threshold", () => {
-    const result = simulateMetrics("cpu_usage");
-    expect(result.unit).toBe("%");
-    expect(result.threshold).toBe(80);
-    expect(result.threshold_breached).toBe(true);
+describe("simulateMetrics", () => {
+  it("reports the breach that actually exists (latency on payments-service)", () => {
+    const m = simulateMetrics("payments-service", "latency_p99", 3600, NOW);
+    expect(m.current).toBe(4230);
+    expect(m.unit).toBe("ms");
+    expect(m.threshold).toBe(1000);
+    expect(m.threshold_breached).toBe(true);
+    expect(m.trend).toBe("rising");
   });
 
-  it("latency_p99 returns ms with correct threshold", () => {
-    const result = simulateMetrics("latency_p99");
-    expect(result.unit).toBe("ms");
-    expect(result.threshold).toBe(1000);
-    expect(result.threshold_breached).toBe(true);
+  it("reports healthy numbers for a healthy service even when a breach was expected", () => {
+    const m = simulateMetrics("auth-service", "latency_p99", 3600, NOW);
+    expect(m.current).toBe(120);
+    expect(m.threshold_breached).toBe(false);
+    expect(m.trend).toBe("stable");
   });
 
-  it("error_rate returns req/s errors", () => {
-    const result = simulateMetrics("error_rate");
-    expect(result.unit).toBe("req/s errors");
-    expect(result.threshold_breached).toBe(true);
+  it("memory breaches only on the OOM-degraded service", () => {
+    expect(simulateMetrics("inventory-service", "memory_usage", 3600, NOW).threshold_breached).toBe(true);
+    expect(simulateMetrics("payments-service", "memory_usage", 3600, NOW).threshold_breached).toBe(false);
   });
 
-  it("memory_usage returns % and detects threshold breach", () => {
-    const result = simulateMetrics("memory_usage");
-    expect(result.unit).toBe("%");
-    expect(result.threshold).toBe(85);
-    expect(result.threshold_breached).toBe(true);
+  it("cpu is healthy when no service has a cpu failure mode", () => {
+    const m = simulateMetrics("payments-service", "cpu_usage", 3600, NOW);
+    expect(m.unit).toBe("%");
+    expect(m.threshold_breached).toBe(false);
   });
 
-  it("unknown metric returns generic unit with no threshold", () => {
-    const result = simulateMetrics("unknown_metric");
-    expect(result.threshold).toBeNull();
-    expect(result.threshold_breached).toBe(false);
+  it("unknown metrics have no threshold and never breach", () => {
+    const m = simulateMetrics("payments-service", "custom_widget_count", 3600, NOW);
+    expect(m.threshold).toBeNull();
+    expect(m.threshold_breached).toBe(false);
+  });
+
+  it("unknown services get healthy baselines", () => {
+    const m = simulateMetrics("ghost-service", "latency_p99", 3600, NOW);
+    expect(m.threshold_breached).toBe(false);
+  });
+
+  it("returns 8 datapoints spanning the requested range", () => {
+    const m = simulateMetrics("payments-service", "latency_p99", 3600, NOW);
+    expect(m.datapoints).toHaveLength(8);
+    expect(new Date(m.datapoints[0].timestamp).getTime()).toBeLessThan(new Date(m.datapoints[7].timestamp).getTime());
   });
 });

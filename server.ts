@@ -1,10 +1,17 @@
 import "dotenv/config";
 import express from "express";
 import path from "path";
-import { createServer as createViteServer } from "vite";
 import { z } from "zod";
-import crypto from "crypto";
 import { eq } from "drizzle-orm";
+
+declare global {
+  namespace Express {
+    interface Request {
+      /** Raw request bytes — required for HMAC signature verification (Slack, webhooks). */
+      rawBody?: Buffer;
+    }
+  }
+}
 
 const ConfigSchema = z.object({
   OPENAI_API_KEY:              z.string().optional(),
@@ -26,31 +33,69 @@ const config = (() => {
 })();
 
 const app = express();
-app.use(express.json());
+// Capture raw bytes so Slack/webhook HMAC signatures can be verified against
+// the exact payload the sender signed (re-serialized JSON does not match).
+app.use(express.json({ verify: (req, _res, buf) => { (req as express.Request).rawBody = buf; } }));
 app.use(express.urlencoded({ extended: true }));
 
 // ─── Imports ──────────────────────────────────────────────────────────────────
 
 import { logger } from "./src/server/logger.js";
-import { sendSlackResponse } from "./src/server/slack.js";
+import { sendSlackResponse, verifySlackSignature } from "./src/server/slack.js";
 import { db, tasks } from "./src/server/db/index.js";
 import { runTaskOrchestrator, recoverStaleTasks } from "./src/server/executor.js";
-import { listMcpTools } from "./src/server/mcp.js";
+import { listMcpTools, closeMcpClient } from "./src/server/mcp.js";
 import { getLLMClient, LLM_MODELS } from "./src/server/llm.js";
-import { authMiddleware, isAuthEnabled } from "./src/server/auth.js";
+import { authMiddleware } from "./src/server/auth.js";
+import { asyncHandler, errorMiddleware } from "./src/server/http.js";
+import { allowTaskCreation, taskCreationRateLimit } from "./src/server/rateLimit.js";
+import { SimulateSchema, clampGoal, zodMessage } from "./src/server/validation.js";
+import { startRetentionLoop } from "./src/server/retention.js";
 import { parseLLMJson, generateTraceId, toErrorMessage } from "./src/utils/index.js";
 
-import { healthRouter } from "./src/routes/health.js";
-import { authRouter }   from "./src/routes/auth.js";
-import { tasksRouter }  from "./src/routes/tasks.js";
-import { memoryRouter } from "./src/routes/memory.js";
+import { healthRouter }   from "./src/routes/health.js";
+import { authRouter }     from "./src/routes/auth.js";
+import { tasksRouter }    from "./src/routes/tasks.js";
+import { memoryRouter }   from "./src/routes/memory.js";
+import { webhooksRouter } from "./src/routes/webhooks.js";
+import { metricsRouter }  from "./src/routes/metrics.js";
 
 // ─── Public routes (no auth) ──────────────────────────────────────────────────
 
-app.post("/api/slack/events", async (req, res) => {
+// Slack retries events up to 3 times on slow/failed responses — track seen
+// event IDs for an hour so retries don't spawn duplicate investigations.
+const seenSlackEvents = new Map<string, number>();
+const SLACK_EVENT_DEDUP_TTL_MS = 60 * 60 * 1000;
+
+app.post("/api/slack/events", asyncHandler(async (req, res) => {
+  const signingSecret = process.env.SLACK_SIGNING_SECRET;
+  if (signingSecret) {
+    const valid = verifySlackSignature(
+      signingSecret,
+      req.headers["x-slack-request-timestamp"] as string | undefined,
+      req.rawBody ?? "",
+      req.headers["x-slack-signature"] as string | undefined
+    );
+    if (!valid) {
+      logger.warn("Rejected Slack event with invalid signature");
+      return res.status(401).json({ error: "Invalid Slack signature" });
+    }
+  } else if (process.env.NODE_ENV === "production") {
+    logger.warn("SLACK_SIGNING_SECRET not set — Slack events are unauthenticated");
+  }
+
   const body = req.body || {};
   if (body.type === "url_verification") {
     return res.status(200).type("text/plain").send(body.challenge);
+  }
+
+  if (body.event_id) {
+    const now = Date.now();
+    for (const [id, ts] of seenSlackEvents) {
+      if (now - ts > SLACK_EVENT_DEDUP_TTL_MS) seenSlackEvents.delete(id);
+    }
+    if (seenSlackEvents.has(body.event_id)) return res.status(200).send();
+    seenSlackEvents.set(body.event_id, now);
   }
 
   const { event } = body;
@@ -60,7 +105,13 @@ app.post("/api/slack/events", async (req, res) => {
   if (event?.type === "message" && !event.bot_id && event.text) {
     const text: string = event.text.trim();
     if (text.startsWith("!incident ") || text.startsWith("<@")) {
-      const goal = text.replace("!incident ", "").replace(/<@[^>]+>/g, "").trim();
+      // Rate-limit per channel; respond silently rather than 429 so Slack doesn't retry
+      if (!allowTaskCreation(`slack:${event.channel}`)) {
+        logger.warn({ channel: event.channel }, "Slack task creation rate-limited");
+        return;
+      }
+
+      const goal = clampGoal(text.replace("!incident ", "").replace(/<@[^>]+>/g, "").trim());
       const traceId = generateTraceId();
 
       const [newTask] = await db.insert(tasks).values({
@@ -70,30 +121,46 @@ app.post("/api/slack/events", async (req, res) => {
         user_id: event.user || "slack-user",
         trace_id: traceId,
         inject_failure: false,
+        team_id: process.env.DEFAULT_TEAM_ID || null,
       }).returning();
 
       await sendSlackResponse(event.channel, event.ts, [], `*Task Enqueued:* \`${traceId}\`\nWorking on: ${goal}...`);
 
-      try {
-        await runTaskOrchestrator(newTask.task_id);
-        const [finalTask] = await db.select().from(tasks).where(eq(tasks.task_id, newTask.task_id));
-        if (finalTask?.status === "completed") {
-          await sendSlackResponse(event.channel, event.ts, [], `*Task Completed:* \`${traceId}\`\n\n${finalTask.final_output}`);
-        } else if (finalTask?.status === "failed") {
-          await sendSlackResponse(event.channel, event.ts, [], `*Task Failed:* \`${traceId}\`\nError: ${finalTask.error}`);
+      // Use setImmediate so the Slack event handler returns immediately — same pattern
+      // as POST /api/tasks. Avoids blocking on a multi-minute orchestration pipeline.
+      setImmediate(async () => {
+        try {
+          await runTaskOrchestrator(newTask.task_id);
+          const [finalTask] = await db.select().from(tasks).where(eq(tasks.task_id, newTask.task_id));
+          if (finalTask?.status === "completed") {
+            await sendSlackResponse(event.channel, event.ts, [], `*Task Completed:* \`${traceId}\`\n\n${finalTask.final_output}`);
+          } else if (finalTask?.status === "failed") {
+            await sendSlackResponse(event.channel, event.ts, [], `*Task Failed:* \`${traceId}\`\nError: ${finalTask.error}`);
+          }
+        } catch (err) {
+          logger.error({ err }, "Task orchestrator failed from Slack event");
         }
-      } catch (err) {
-        logger.error({ err }, "Task orchestrator failed from Slack event");
-      }
+      });
     }
   }
-});
+}));
 
 app.get("/api/slack/oauth_redirect", (_req, res) => {
   res.send("Slack OAuth redirect successful. You can close this window.");
 });
 
-app.get("/api/tools", async (_req, res) => {
+// Webhooks are public — no JWT required (they use their own signing verification)
+app.use("/api", webhooksRouter);
+
+app.use("/api", authRouter);
+
+// Health endpoints stay public so k8s liveness/readiness probes work without a JWT
+app.use("/api", healthRouter);
+
+// Apply JWT auth to all remaining /api routes
+app.use("/api", authMiddleware);
+
+app.get("/api/tools", asyncHandler(async (_req, res) => {
   try {
     const tools = await listMcpTools();
     return res.json({ tools });
@@ -101,12 +168,13 @@ app.get("/api/tools", async (_req, res) => {
     logger.error({ err }, "Failed to list MCP tools");
     return res.status(503).json({ error: "MCP tools server unavailable" });
   }
-});
+}));
 
 // Incident simulation (quick LLM call, not checkpointed — for demo purposes)
-app.post("/api/simulate", async (req, res) => {
-  const { title, description, severity, channel } = req.body;
-  if (!title || !description) return res.status(400).json({ error: "Missing incident title or description" });
+app.post("/api/simulate", taskCreationRateLimit, asyncHandler(async (req, res) => {
+  const parsedBody = SimulateSchema.safeParse(req.body);
+  if (!parsedBody.success) return res.status(400).json({ error: zodMessage(parsedBody.error) });
+  const { title, description, severity, channel } = parsedBody.data;
 
   const ai = getLLMClient();
   const traceId = generateTraceId();
@@ -144,26 +212,25 @@ app.post("/api/simulate", async (req, res) => {
       temperature: 0.2,
       response_format: { type: "json_object" },
     });
-    const data = parseLLMJson(completion.choices[0].message.content || "{}");
+    const data = parseLLMJson(completion.choices?.[0]?.message?.content ?? "{}");
     return res.json({ ...(data as object), traceId, fallbackMode: false });
   } catch (err) {
     return res.status(500).json({ error: "Simulation pipeline failed", details: toErrorMessage(err) });
   }
-});
+}));
 
-app.use("/api", authRouter);
-
-// Apply JWT auth to all remaining /api routes
-app.use("/api", authMiddleware);
-
-app.use("/api", healthRouter);
 app.use("/api", tasksRouter);
 app.use("/api", memoryRouter);
+app.use("/api", metricsRouter);
+
+app.use(errorMiddleware);
 
 // ─── Frontend ─────────────────────────────────────────────────────────────────
 
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
+    // Dev-only dynamic import — keeps vite out of the production bundle/image
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
@@ -172,10 +239,33 @@ async function startServer() {
     app.get("*", (_req, res) => res.sendFile(path.join(distPath, "index.html")));
   }
 
-  app.listen(config.PORT, "0.0.0.0", async () => {
+  const httpServer = app.listen(config.PORT, "0.0.0.0", async () => {
     console.log(`AgentCore running on http://localhost:${config.PORT}`);
-    await recoverStaleTasks();
+    // A transient DB error during recovery must not crash the freshly started server
+    await recoverStaleTasks().catch((err) => logger.error({ err }, "Stale task recovery failed"));
+    startRetentionLoop();
   });
+
+  // ─── Graceful shutdown ──────────────────────────────────────────────────────
+  // On SIGTERM/SIGINT: flush OTel spans, close DB pool, kill MCP subprocess,
+  // stop accepting new connections.
+
+  const { tracer: _t, trace, context: _c } = await import("./src/server/telemetry.js");
+  const otelProvider = (trace as unknown as { getTracerProvider: () => { forceFlush?: () => Promise<void> } }).getTracerProvider();
+  const { db: pgDb } = await import("./src/server/db/index.js");
+
+  async function shutdown(signal: string) {
+    logger.info({ signal }, "Graceful shutdown initiated");
+    httpServer.close();
+    await otelProvider.forceFlush?.().catch(() => {});
+    await closeMcpClient();
+    // postgres-js exposes end() to drain the pool
+    await (pgDb as unknown as { $client: { end: () => Promise<void> } }).$client.end().catch(() => {});
+    process.exit(0);
+  }
+
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT",  () => void shutdown("SIGINT"));
 }
 
 startServer();

@@ -1,0 +1,75 @@
+{
+  "description": "Golden incident scenarios scored against the simulation world model (tools/simulation.ts). Deterministic without an LLM key (planner/synthesizer fallbacks); with a key, scores measure real planner+synthesizer quality against the same ground truth. Scoring text = summary + probable_cause of the final report.",
+  "scenarios": [
+    {
+      "id": "latency-payments",
+      "goal": "payments-service p99 latency at 4s after deploy",
+      "why": "Classic true-positive: the world model has a real latency regression here.",
+      "expect": {
+        "affected": ["payments-service"],
+        "cause_any": ["latency", "threshold", "circuit breaker", "timed out", "slow query"],
+        "forbidden": ["deadlock", "heap", "OOM"]
+      }
+    },
+    {
+      "id": "deadlock-orders",
+      "goal": "orders-service transactions failing with lock errors",
+      "why": "True-positive for the deadlock failure mode.",
+      "expect": {
+        "affected": ["orders-service"],
+        "cause_any": ["deadlock", "lock", "latency"],
+        "forbidden": ["heap", "OOM"]
+      }
+    },
+    {
+      "id": "oom-inventory",
+      "goal": "inventory-service pods restarting and memory climbing",
+      "why": "True-positive for the OOM failure mode.",
+      "expect": {
+        "affected": ["inventory-service"],
+        "cause_any": ["heap", "OOM", "memory", "OOMKiller"],
+        "forbidden": ["deadlock"]
+      }
+    },
+    {
+      "id": "wrong-symptom-payments",
+      "goal": "suspected database deadlock on payments-service",
+      "why": "Anti-circularity: the alert claims deadlock but the world model has a latency regression. The report must describe what the data shows, not what the alert claimed.",
+      "expect": {
+        "affected": ["payments-service"],
+        "cause_any": ["latency", "threshold", "circuit breaker", "timed out"],
+        "forbidden": ["deadlock"]
+      }
+    },
+    {
+      "id": "healthy-auth",
+      "goal": "auth-service 401 errors spiking after deploy v2.3",
+      "why": "False alarm: auth-service is healthy in the world model. The honest outcome is 'no clear anomaly', not a fabricated cause.",
+      "expect": {
+        "affected": ["auth-service"],
+        "cause_any": ["further investigation", "no error-level", "no clear anomaly"],
+        "forbidden": ["deadlock", "heap", "OOM", "threshold breach:"]
+      }
+    },
+    {
+      "id": "healthy-notification",
+      "goal": "notification-service email delivery delayed",
+      "why": "Second false alarm on a healthy service.",
+      "expect": {
+        "affected": ["notification-service"],
+        "cause_any": ["further investigation", "no error-level", "no clear anomaly"],
+        "forbidden": ["deadlock", "heap", "OOM", "threshold breach:"]
+      }
+    },
+    {
+      "id": "unknown-service",
+      "goal": "checkout-service returning 500s to mobile clients",
+      "why": "Service outside the known world: the pipeline must not invent findings about a system it has no data for.",
+      "expect": {
+        "affected": ["checkout-service", "unknown-service"],
+        "cause_any": ["further investigation", "no error-level", "no clear anomaly"],
+        "forbidden": ["deadlock", "heap", "OOM", "threshold breach:"]
+      }
+    }
+  ]
+}

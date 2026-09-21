@@ -6,6 +6,8 @@ dist
 .git
 .github/assets
 scripts
+# migrate.mjs is needed at container startup (Dockerfile CMD)
+!scripts/migrate.mjs
 tests
 .node-version
 *.log

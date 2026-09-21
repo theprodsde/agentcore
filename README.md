@@ -1,16 +1,91 @@
 # AgentCore
 
 [![CI](https://github.com/TheProdSDE/agentcore/actions/workflows/ci.yml/badge.svg)](https://github.com/TheProdSDE/agentcore/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-57%20passing-brightgreen?logo=vitest&logoColor=white)](https://github.com/TheProdSDE/agentcore/actions)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![Node.js](https://img.shields.io/badge/Node.js-22-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-24-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-theprodsde-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://www.buymeacoffee.com/theprodsde)
-[![PayPal](https://img.shields.io/badge/PayPal-Donate-00457C?logo=paypal&logoColor=white)](https://www.paypal.com/paypalme/karangehlod)
 
-An AI-powered incident response orchestrator. AgentCore runs a resilient 4-step pipeline — memory retrieval, LLM planning, MCP tool execution, and synthesis — with per-step checkpointing so tasks survive failures and resume exactly where they left off.
+**Self-hosted, stack-agnostic AI incident triage — with checkpointed resume and episodic memory.**
 
-Trigger incidents from Slack or the web dashboard. Every run is traced, checkpointed, and written back into an episodic memory store so the planner learns from past incidents.
+When an alert fires, AgentCore runs a 4-step pipeline — recall similar past incidents, plan tool calls with an LLM, query your logs/metrics/runbooks via MCP, synthesize a report — and posts the analysis back to Slack in ~30 seconds. Every step is checkpointed to Postgres (a crash mid-investigation resumes from the failed step, not from scratch), and every resolved incident is written back into pgvector memory, so the second DB deadlock surfaces what fixed the first one.
+
+The closed alternatives (PagerDuty AIOps, incident.io, Datadog) are expensive and take your incident data with them. The open ones are mostly Kubernetes-only. AgentCore is Apache-2.0, runs on your infra against whatever stack you have (Loki, Prometheus, Linear today — [add your own tool](CONTRIBUTING.md) in one file), and works with local models so **no incident data ever leaves your network**.
+
+## Try it in 90 seconds — no clone, no API keys
+
+![AgentCore demo](.github/assets/mcp-demo.gif)
+
+Every tool has a deterministic simulation fallback, so the full stack runs with zero credentials. Two commands, using the prebuilt image from GHCR:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/theprodsde/agentcore/main/docker-compose.demo.yml -o agentcore-demo.yml
+docker compose -f agentcore-demo.yml up
+```
+
+(Have an OpenAI key? `OPENAI_API_KEY=sk-... docker compose -f agentcore-demo.yml up` upgrades planning and synthesis to a real LLM. Prefer building from source? `git clone https://github.com/theprodsde/agentcore && cd agentcore && docker compose up --build`.)
+
+Then open `http://localhost:3000`, hit **New Task**, and describe an incident — try
+`payments-service p99 latency at 4s after deploy`. Or from the terminal:
+
+```bash
+curl -X POST http://localhost:3000/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"goal": "payments-service p99 latency at 4s after deploy"}'
+```
+
+Watch the 4-step checkpoint timeline stream live, then grab the post-mortem at `/api/tasks/<task_id>/export.md`. Add `OPENAI_API_KEY` (or [point it at Ollama](#local-models--ollama)) for real LLM planning, and backend URLs for real data — same pipeline, no code changes.
+
+<details>
+<summary><b>What the output looks like</b> — a real exported post-mortem (LLM-synthesized from simulated tool data)</summary>
+
+```markdown
+# Post-Mortem: payments-service p99 latency at 4s after deploy
+
+**Trace ID:** `tr-7q6d5xhl9-8193`
+**Total duration:** 8.3s
+**Retries:** 0
+
+## Summary
+
+The payments-service experienced a significant increase in latency, rising to
+4230 ms within the last hour, triggering a threshold breach. Multiple errors,
+including deadlocks and lock wait timeouts, were logged during this period.
+
+## Probable Cause
+
+The combination of high latency and deadlock conditions is likely due to
+resource contention or saturation within the payments-service and its database
+interactions, specifically related to transaction locking.
+
+## Affected Systems
+
+- `payments-service`
+- `postgres-primary`
+
+## Next Actions
+
+1. Review and scale horizontal replicas of the payments-service to handle the increased load.
+2. Investigate the cause of deadlocks and optimize database queries to reduce contention.
+3. Consult the High Latency Runbook for payments-service for further troubleshooting steps.
+
+## Ticket
+
+`INC-20260920-001`
+
+## Checkpoint Timeline
+
+| Step | Name | Status | Duration |
+|------|------|--------|----------|
+| 1 | memory retrieval | success | 1.3s |
+| 2 | planner | success | 4.7s |
+| 3 | execution | success | 7ms |
+| 4 | synthesizer | success | 2.4s |
+```
+
+With `OPENAI_API_KEY` set, the report is synthesized by the LLM from real tool output; without it, it's derived deterministically from the simulated data — same structure either way.
+
+</details>
 
 ## Who is this for, and when should you use it
 
@@ -66,7 +141,7 @@ The core difference is **state and learning**:
 | Team size | Expected outcome |
 |---|---|
 | 3–10 engineers | Eliminates the "everyone stops to help the on-call" pattern for routine incidents. One person + AgentCore handles initial triage |
-| 10–50 engineers | Reduces mean time to understand (MTTU) from 20–40 min to 2–5 min for known incident classes. Frees senior engineers from repetitive triage |
+| 10–50 engineers | Designed to cut mean time to understand (MTTU) for known incident classes from tens of minutes to a few — validate on your own incidents with the [eval harness](evals/golden-incidents.json). Frees senior engineers from repetitive triage |
 | 50+ engineers, multiple teams | Multi-tenant deployment lets each team own their memory and tasks independently. Platform team can build shared tool servers that all teams consume |
 | Post-incident compliance | Full checkpoint + trace record per incident satisfies audit requirements in finance, healthcare, and regulated industries |
 
@@ -77,7 +152,7 @@ The core difference is **state and learning**:
         ↓
   1. Memory Retrieval   — pgvector cosine similarity against past incidents
   2. LLM Planner        — selects tools from live manifest with per-tool args
-  3. MCP Tool Execution — search_logs, get_metrics, create_ticket, list_services
+  3. MCP Tool Execution — search_logs, get_metrics, search_runbook, create_ticket, list_services
   4. Synthesizer        — derives report from actual tool output, writes to memory
         ↓
 [Result posted to Slack thread / visible in Dashboard]
@@ -128,13 +203,60 @@ If any step fails, the task pauses. On resume, completed checkpoints are skipped
 | Feature | Detail |
 |---|---|
 | Checkpointed orchestration | Every step persists input/output to Postgres; resumes from last failed step |
-| pgvector semantic memory | Memories embedded with `text-embedding-3-small` and retrieved by cosine similarity |
-| Dynamic MCP tool selection | LLM planner receives live tool manifest and outputs per-tool args |
-| Real tool backends | `search_logs` → Loki, `get_metrics` → Prometheus, `create_ticket` → Linear (all fall back gracefully) |
+| pgvector semantic memory | Memories embedded with `text-embedding-3-small`, retrieved by cosine similarity with time-decay re-ranking |
+| Dynamic MCP tool selection | LLM planner receives live tool manifest and outputs per-tool args; 0/1 Knapsack DP prunes to fit time budget |
+| 5 built-in MCP tools | `search_logs` → Loki · `get_metrics` → Prometheus · `search_runbook` → runbook API · `create_ticket` → Linear · `list_services` |
+| Incident deduplication | Jaccard + bounded Levenshtein DP + LCS similarity — returns existing task if a match is found within 10 minutes |
 | OpenTelemetry tracing | Every step is a span; `trace_id`/`span_id` injected into every Pino log line |
 | JWT auth + multi-tenancy | HS256 tokens, per-team task/memory isolation; auth is a no-op when `JWT_SECRET` unset |
+| Webhook ingestion | PagerDuty, OpsGenie, Alertmanager — HMAC-verified payloads create tasks automatically |
 | Slack integration | `!incident <description>` triggers a full pipeline run; result posted back to thread |
-| Detailed health endpoint | `/api/health/detailed` checks DB latency, LLM config, MCP tools, OTel status |
+| Post-mortem export | `GET /api/tasks/:id/export.md` — downloadable Markdown post-mortem |
+| Metrics dashboard | `/metrics` page + `/api/metrics` endpoint — 30-day summary, step p95, weekly trend |
+| CLI | `node scripts/run.mjs "<goal>"` — run investigations from the terminal with live streaming |
+| MCP server | Expose AgentCore itself to Claude Code / Claude Desktop / Cursor — investigate, query memory, export post-mortems from any MCP client |
+| Dry-run mode | `dry_run: true` — full pipeline without writing to memory or creating tickets |
+| Graceful shutdown | SIGTERM → flush OTel spans → drain DB pool → close MCP subprocess |
+
+## Use AgentCore from Claude (MCP)
+
+AgentCore ships an MCP server that exposes a running instance to any MCP client — Claude Code, Claude Desktop, Cursor. Ask Claude *"investigate the latency spike on payments-service"* and it runs a full checkpointed investigation with your team's incident memory behind it.
+
+```bash
+# Claude Code
+claude mcp add agentcore --env AGENTCORE_URL=http://localhost:3000 \
+  -- node /path/to/agentcore/dist/tools/agentcore-mcp.cjs
+```
+
+```json
+// Claude Desktop (claude_desktop_config.json)
+{
+  "mcpServers": {
+    "agentcore": {
+      "command": "node",
+      "args": ["/path/to/agentcore/dist/tools/agentcore-mcp.cjs"],
+      "env": { "AGENTCORE_URL": "http://localhost:3000", "AGENTCORE_TOKEN": "eyJ... (only if JWT auth is enabled)" }
+    }
+  }
+}
+```
+
+Exposed tools: `investigate_incident` (runs the pipeline, waits for the report), `get_investigation` (status + checkpoint timeline), `search_incident_memory` (semantic search over past incidents), `export_postmortem` (Markdown). During development, `npm run mcp` runs it from source.
+
+## Local models / Ollama
+
+AgentCore speaks the OpenAI API, so any compatible endpoint works — including [Ollama](https://ollama.com). No incident data leaves your network:
+
+```bash
+ollama pull qwen2.5:14b   # any tool-capable instruct model works
+
+# .env
+OPENAI_BASE_URL=http://localhost:11434/v1
+OPENAI_API_KEY=ollama          # any non-empty value
+LLM_MODEL=qwen2.5:14b
+```
+
+The planner and synthesizer now run fully local. One honest caveat: the memory store expects 1536-dimension embeddings (`text-embedding-3-small`). If your local endpoint can't serve a 1536-dim embedding model, embedding calls fail gracefully and memory retrieval falls back to recency + keyword ranking — everything still works, semantic recall is just weaker. Configurable embedding dimensions are on the [roadmap](ROADMAP.md).
 
 ## Quickstart
 
@@ -144,6 +266,12 @@ If any step fails, the task pauses. On resume, completed checkpoints are skipped
 cp .env.example .env
 # fill in OPENAI_API_KEY and optionally Slack/Linear credentials
 docker-compose up --build
+```
+
+Prebuilt images are published to GHCR on every release:
+
+```bash
+docker pull ghcr.io/theprodsde/agentcore:latest
 ```
 
 - App: `http://localhost:3000`
@@ -158,8 +286,7 @@ cp .env.example .env   # fill in DATABASE_URL + OPENAI_API_KEY
 docker run -d --name agentcore-pg -e POSTGRES_USER=agentcore \
   -e POSTGRES_PASSWORD=agentcore -e POSTGRES_DB=agentcore \
   -p 5432:5432 pgvector/pgvector:pg16
-docker exec agentcore-pg psql -U agentcore -d agentcore -c "CREATE EXTENSION IF NOT EXISTS vector;"
-npm run db:push
+npm run db:migrate    # creates the pgvector extension + applies versioned migrations
 npm run dev
 ```
 
@@ -167,19 +294,31 @@ npm run dev
 
 | Variable | Required | Description |
 |---|---|---|
-| `DATABASE_URL` | Yes | Postgres connection string |
+| `DATABASE_URL` | Yes | Postgres connection string (must have pgvector extension) |
 | `OPENAI_API_KEY` | For LLM steps | OpenAI-compatible key |
 | `OPENAI_BASE_URL` | No | Override API base (local models, etc.) |
 | `LLM_MODEL` | No | Model for planner + synthesizer (default: `gpt-4o-mini`) |
 | `EMBEDDING_MODEL` | No | Embedding model (default: `text-embedding-3-small`) |
 | `JWT_SECRET` | No | Enables JWT auth when set. Unset = auth disabled (dev mode) |
 | `SLACK_BOT_TOKEN` | No | Enables real Slack message delivery |
-| `SLACK_SIGNING_SECRET` | No | Slack event verification |
+| `SLACK_SIGNING_SECRET` | No | Verifies Slack event signatures (v0 HMAC + replay protection). Unset = events accepted unverified (dev only) |
 | `MCP_SERVER_URL` | No | External MCP server (SSE). Unset = spawns bundled tools server |
 | `LOKI_URL` | No | Loki log backend for `search_logs` tool |
 | `PROMETHEUS_URL` | No | Prometheus backend for `get_metrics` tool |
+| `RUNBOOK_URL` | No | Runbook search API for `search_runbook` tool |
 | `LINEAR_API_KEY` | No | Linear ticket creation for `create_ticket` tool |
 | `LINEAR_TEAM_ID` | No | Linear team ID |
+| `PAGERDUTY_WEBHOOK_SECRET` | No | HMAC secret for PagerDuty webhook verification |
+| `OPSGENIE_WEBHOOK_SECRET` | No | HMAC secret for OpsGenie webhook verification |
+| `ALERTMANAGER_SECRET` | No | Shared secret header for Alertmanager webhook |
+| `TOOL_BUDGET_MS` | No | Max total tool execution time per task in ms (default: `15000`) |
+| `TOOL_CALL_TIMEOUT_MS` | No | Hard wall-clock timeout per MCP tool call in ms (default: `10000`) |
+| `LLM_TIMEOUT_MS` | No | Timeout per LLM API call in ms (default: `60000`) |
+| `RATE_LIMIT_RPM` | No | Max task creations per minute per team/IP/channel (default: `30`, `0` disables) |
+| `RETENTION_DAYS` | No | Purge tasks + checkpoints older than N days (default: keep forever) |
+| `MEMORY_RETENTION_DAYS` | No | Purge episodic memories older than N days (default: keep forever) |
+| `DEFAULT_TEAM_ID` | No | Team that owns Slack/webhook-created tasks. Unset = visible to all teams (single-tenant only) |
+| `DISABLE_TEAM_SIGNUP` | No | `true` blocks `POST /api/teams` after initial bootstrap |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | OTLP endpoint for Jaeger/Grafana Tempo |
 | `LOG_LEVEL` | No | Pino log level (default: `warn`) |
 
@@ -205,34 +344,49 @@ curl http://localhost:3000/api/tasks \
 
 Tasks and memories are isolated per team. A token from team A cannot read team B's data.
 
+The web dashboard shows a login screen automatically when auth is enabled — paste a team API key and it's exchanged for a session token (stored locally, re-prompted on expiry).
+
+![Login](.github/assets/07-login.png) Manage keys via `GET`/`POST`/`DELETE /api/teams/:team_id/api-keys` — the last remaining key cannot be revoked, so a team can't lock itself out. Set `DISABLE_TEAM_SIGNUP=true` once your teams exist, and `DEFAULT_TEAM_ID` so Slack/webhook-created tasks belong to a team instead of being globally visible.
+
 ## Project structure
 
 ```
-server.ts               Express entry point — mounts routes, handles Slack, starts server
+server.ts               Express entry point — mounts routes, handles Slack, graceful shutdown
+scripts/
+  run.mjs               CLI — run investigations from the terminal with live streaming
 src/
+  components/
+    ErrorBoundary.tsx   React error boundary — catches render errors, shows fallback UI
   routes/               Route handlers (one file per domain)
     auth.ts             POST /api/teams, POST /api/auth/token, POST /api/teams/:id/api-keys
-    health.ts           GET /api/health, GET /api/health/detailed
-    tasks.ts            CRUD + SSE stream + resume
-    memory.ts           Memory retrieval + pgvector semantic query
+    health.ts           GET /api/health, GET /api/health/detailed (parallel checks)
+    tasks.ts            CRUD + SSE stream + resume + post-mortem export + incident dedup
+    memory.ts           Memory retrieval + pgvector semantic query (paginated)
+    metrics.ts          GET /api/metrics — 30-day summary, step p95, weekly trend (cached)
+    webhooks.ts         POST /api/webhooks/{pagerduty,opsgenie,alertmanager} (HMAC-verified)
   server/
-    executor.ts         Orchestrator + four step handlers (individually exported + testable)
+    executor.ts         Orchestrator + step handlers + 0/1 Knapsack tool selection
     auth.ts             JWT middleware, token signing, API key hashing
+    cache.ts            LRU TTL cache (doubly-linked list + HashMap) for tool results
     llm.ts              Shared OpenAI client singleton + model constants
-    embeddings.ts       text-embedding-3-small wrapper with null fallback
+    embeddings.ts       text-embedding-3-small wrapper with LRU memoization
     mcp.ts              MCP client — spawns tools/server.ts via stdio or connects via SSE
     telemetry.ts        OTel provider + tracer export
     logger.ts           Pino logger with trace_id/span_id mixin
-    db/                 Drizzle schema + connection
+    db/                 Drizzle schema + connection (pgvector, 5 indexes)
   utils/
     index.ts            parseLLMJson, generateTraceId, toErrorMessage
+    algorithms.ts       Levenshtein DP, bounded DP, LCS, top-k heap, LRU, Jaccard, Knapsack
+    synthesis.ts        deriveSynthesisFromOutput — pure function, no infrastructure deps
 tools/
-  server.ts             MCP tool server — search_logs, get_metrics, create_ticket, list_services
+  server.ts             MCP tool server — search_logs, get_metrics, search_runbook, create_ticket, list_services
   README.md             How to add tools and connect real backends
 tests/
   unit/
+    algorithms.test.ts  Levenshtein, LCS, Knapsack, top-k, Jaccard, LRU, similarity
     auth.test.ts        JWT, API key hashing, middleware
     executor.test.ts    deriveSynthesisFromOutput, planner/synthesizer output contracts
+    slack.test.ts       Slack request signature verification (HMAC v0, replay protection)
     tools.test.ts       parseRange, filter logic, metric simulation, output shapes
     utils.test.ts       parseLLMJson, generateTraceId, toErrorMessage
 ```
@@ -248,7 +402,14 @@ npm run test:watch   # Watch mode
 npm run test:coverage  # Coverage report
 npm run db:push      # Push schema to DB (creates/alters tables)
 npm run db:studio    # Open Drizzle Studio
+npm run eval         # Score triage quality against the golden incidents (needs a running server)
 ```
+
+## Triage quality is evaluated, not assumed
+
+The demo data is an adversarial **world model** ([tools/simulation.ts](tools/simulation.ts)): each simulated service has a fixed state (healthy, or degraded with a specific failure mode), and log/metric output derives from *that state* — never from your query. Ask about a deadlock on a service that actually has a latency regression and the report describes the latency regression. Ask about a healthy service and the honest answer is "no clear anomaly found."
+
+CI runs a [golden-incident eval](evals/golden-incidents.json) on every push: true-positive scenarios, false alarms on healthy services, an unknown-service case, and an anti-circularity case where the alert's claimed symptom is wrong. Reports are scored for identifying the real cause and — just as important — for **not fabricating findings** the data doesn't support. Run it against your own deployment with `npm run eval`, or point the scenarios at real backends to benchmark LLM/prompt changes.
 
 ## Adding a new MCP tool
 
@@ -256,11 +417,13 @@ See [tools/README.md](tools/README.md). Add the tool definition to `TOOL_REGISTR
 
 ## Production path
 
-See [PRODUCTION.md](PRODUCTION.md) for how to swap each stub for a real integration. See [DEVELOPMENT.md](DEVELOPMENT.md) for the full phase roadmap.
+See [PRODUCTION.md](PRODUCTION.md) for how to swap each stub for a real integration. See [ARCHITECTURE.md](ARCHITECTURE.md) for the system map, extension points (new tools, pipeline steps, alert sources), and the scaling seams where future features land. See [DEVELOPMENT.md](DEVELOPMENT.md) for the full phase roadmap.
 
 ## Contributing
 
-Pull requests are welcome. Please read the [PR template](.github/PULL_REQUEST_TEMPLATE.md) before opening one — it's short. The checklist covers the basics: types clean, tests green, no secrets in the diff.
+Pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for setup and conventions. The best first contribution is a new tool backend (Elasticsearch, Grafana, Jira, Datadog, ...): the whole pattern lives in one file, and issues labeled `good first issue` + `tool-integration` have step-by-step specs.
+
+Please read the [PR template](.github/PULL_REQUEST_TEMPLATE.md) before opening a PR — it's short. The checklist covers the basics: types clean, tests green, no secrets in the diff.
 
 For bugs, use the [bug report](.github/ISSUE_TEMPLATE/bug_report.yml) template. For new tools or integrations, use the [feature request](.github/ISSUE_TEMPLATE/feature_request.yml) template.
 

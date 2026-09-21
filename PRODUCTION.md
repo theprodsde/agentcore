@@ -1,56 +1,148 @@
-# Production Readiness & Real-World Integration
+# Production Deployment Guide
 
-While the current `executor.ts` uses simulated delays and deterministic outputs to guarantee a stable demonstration of the core autonomous checkpointing loops, the architecture is specifically designed to swap out these stubs for real integrations without changing the state machine or UI.
+This document covers what's wired up, what requires your credentials, how to operate AgentCore in a real environment — and, just as importantly, the known limits you should design around.
 
-Here is the exact path to transition from the current "Demo Scenario" into a real-world enterprise deployment.
+---
 
-## 1. Durable State (The Checkpoint Database)
-**Current:** `inMemoryDB` (Map / Array in Node memory) 
-**Production:** Postgres via Drizzle ORM / Prisma + Redis layer.
-**How to swap:**
-Because `executor.ts` reads/writes purely to the Checkpoint and Task interfaces, you replace `inMemoryDB.tasks.set(taskId, ...)` with `await db.insert(tasks).values(...)`. If the Docker container crashes, the orchestrator boot sequence simply polls Postgres for `status = 'failed'` and resumes from the newest `step_number`.
+## What's already wired up
 
-## 2. Real LLM Reasoning (CometAPI / OpenAI / Gemini)
-**Current:** Hard-coded return objects based on the step name.
-**Production:** `@google/genai` or `openai` package handling the LLM synthesis.
-**How to swap:**
-Inside `executeStep`, replace the mock response with an actual prompt chain. The orchestrator feeds the previous checkpoint string directly:
-```typescript
-const response = await ai.generateContent({
-  model: 'gemini-2.0-flash',
-  contents: `You are an Incident Planner. Based on this memory ${memoryContext}, create a plan.`
-});
-return JSON.parse(response.text);
+All of the following work as-is — you only need to provide credentials via environment variables:
+
+| Component | Status | What to provide |
+|---|---|---|
+| Postgres persistence | ✅ Ready | `DATABASE_URL` |
+| pgvector semantic memory | ✅ Ready | `DATABASE_URL` (pgvector extension required) |
+| LLM planner + synthesizer | ✅ Ready | `OPENAI_API_KEY` |
+| Embeddings | ✅ Ready | `OPENAI_API_KEY` |
+| MCP tools | ✅ Ready | Tool-specific env vars (optional — all fall back to simulation) |
+| Slack integration | ✅ Ready | `SLACK_BOT_TOKEN` + `SLACK_SIGNING_SECRET` |
+| JWT auth | ✅ Ready | `JWT_SECRET` |
+| OTel tracing | ✅ Ready | `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| Webhook ingestion | ✅ Ready | Signing secrets (optional — skipped if unset) |
+| Graceful shutdown | ✅ Ready | Nothing |
+
+---
+
+## Recommended single-command start
+
+```bash
+cp .env.example .env   # fill in DATABASE_URL + OPENAI_API_KEY + JWT_SECRET
+docker-compose up --build
 ```
 
-## 3. Real Tool Execution (MCP Client)
-**Current:** Mock delays returning simulated tool outputs (e.g. "Discovered repeated deadlock").
-**Production:** The `@modelcontextprotocol/sdk` connected to your infrastructure.
-**How to swap:**
-The `planning` step outputs a list of tools (e.g., `['search_logs', 'get_metrics']`). You map these directly to your internal MCP server (connecting via `stdio` to a local binary, or HTTP SSE to an internal tools API).
-```typescript
-const mcpClient = new MCPClient({ transport: new StdioTransport(...) });
-const results = await Promise.all(
-  planContext.tools_selected.map(tool => mcpClient.callTool(tool, args))
-);
-return results;
+This boots pgvector Postgres, Jaeger, and the app. On startup the app applies versioned migrations (`node scripts/migrate.mjs`, using drizzle-orm's bundled migrator — no drizzle-kit or registry access needed in the image) and then calls `recoverStaleTasks()` to resume tasks that were in flight during the previous 24 hours.
+
+---
+
+## Security checklist before going live
+
+| Setting | Why |
+|---|---|
+| `JWT_SECRET` | Without it, **every API endpoint is open** — anyone can read tasks, memories, and create investigations |
+| `SLACK_SIGNING_SECRET` | Without it, anyone who discovers the URL can forge Slack events and trigger LLM-backed investigations (token cost + data exposure) |
+| Webhook secrets (`PAGERDUTY_WEBHOOK_SECRET`, `OPSGENIE_WEBHOOK_SECRET`, `ALERTMANAGER_SECRET`) | Webhook endpoints are public by design; unsigned = anyone can create tasks |
+| `DISABLE_TEAM_SIGNUP=true` | After creating your teams — otherwise anyone who reaches the server can mint a tenant |
+| `DEFAULT_TEAM_ID` | Slack/webhook tasks without it have no team and are visible to every authenticated team |
+| `RATE_LIMIT_RPM` | Built-in token-bucket limit on task creation (default 30/min per team/IP/channel). Keep it, and set spend limits on your LLM key |
+| `RETENTION_DAYS` | Checkpoints store raw log/metric output — decide how long incident data may live in this DB |
+| Reverse proxy with TLS | AgentCore does not terminate TLS; put nginx/Caddy/an ALB in front (and rate-limit non-task endpoints there) |
+
+Signature verification is performed against the **raw request bytes** (captured before JSON parsing), with timing-safe comparison and, for Slack, a 5-minute replay window.
+
+---
+
+## Connecting real tool backends
+
+### Loki (log search)
+```
+LOKI_URL=http://loki.your-infra.internal:3100
+```
+The `search_logs` tool issues `{service="<name>"} |~ "<query>"` LogQL queries.
+
+### Prometheus (metrics)
+```
+PROMETHEUS_URL=http://prometheus.your-infra.internal:9090
+```
+The `get_metrics` tool issues `<metric>{service="<name>"}` range queries.
+
+### Runbook search
+```
+RUNBOOK_URL=https://your-confluence-or-wiki-search-endpoint
+```
+The `search_runbook` tool calls `GET /search?q=<query>&service=<service>`. Expected response: `{ results: [{ title, url, excerpt }] }`.
+
+### Linear (ticket creation)
+```
+LINEAR_API_KEY=lin_api_...
+LINEAR_TEAM_ID=<your-team-uuid>
+```
+The `create_ticket` tool calls the Linear GraphQL `issueCreate` mutation.
+
+---
+
+## Webhook ingestion (auto-trigger from alerting)
+
+When signatures are not configured, webhooks are accepted from anyone — configure at minimum one secret in production:
+
+```
+PAGERDUTY_WEBHOOK_SECRET=<your-pd-webhook-secret>
+OPSGENIE_WEBHOOK_SECRET=<your-opsgenie-secret>
+ALERTMANAGER_SECRET=<your-shared-header-value>
 ```
 
-## 4. Full Slack Web API Integration
-**Current:** The `/api/slack/events` acknowledges challenges and drops the payload.
-**Production:** `@slack/web-api` package (`WebClient`).
-**How to swap:**
-When a Slack Event hits the endpoint, you parse the user text, call `runTaskOrchestrator()`, and attach a listener. When `taskEventEmitter` fires `{ status: 'completed' }`, you utilize the `WebClient` to inject the final `final_output` back into the source Slack thread.
+Point your alert source at:
+- PagerDuty: `POST /api/webhooks/pagerduty`
+- OpsGenie: `POST /api/webhooks/opsgenie`
+- Alertmanager: `POST /api/webhooks/alertmanager`
 
-```typescript
-// On task completion inside executor.ts
-if (task.channel_id) {
-  await slackClient.chat.postMessage({
-    channel: task.channel_id,
-    text: `*Incident Resolution Task Complete*\n${response}`
-  });
-}
+---
+
+## Scaling considerations
+
+**Single-node (current):** the orchestrator uses `setImmediate` to enqueue tasks in-process. Works correctly for low-to-medium volume.
+
+**Multi-node:** replace `setImmediate(() => runTaskOrchestrator(...))` with a Redis queue (`ioredis` + BullMQ). The orchestrator logic is unchanged — only the dispatch mechanism changes. `DATABASE_URL` is already shared across instances.
+
+**Connection pool:** tuned to `max: 20, idle_timeout: 30s, connect_timeout: 10s`. Adjust `max` to match your Postgres `max_connections`.
+
+**Tool execution limits:** each MCP tool call is capped by `TOOL_CALL_TIMEOUT_MS` (default 10s) so a hung backend cannot stall a step; the knapsack pruner keeps total estimated tool time under `TOOL_BUDGET_MS`.
+
+---
+
+## Known limitations (design around these)
+
+- **Single-process task queue.** Tasks run in-process via `setImmediate`. If the process dies mid-task, checkpoints preserve progress and `recoverStaleTasks()` resumes on restart — but running two app replicas will double-process recovered tasks. Run one replica, or swap dispatch for BullMQ before scaling out.
+- **SSE task streams are per-process.** With multiple replicas behind a load balancer, a client may connect to a replica that isn't executing its task. Use sticky sessions or single-replica until a shared event bus exists.
+- **Rate limiting covers task creation only** (token bucket, `RATE_LIMIT_RPM`). Read endpoints rely on your proxy. Set spend limits on your LLM key regardless.
+- **Team creation (`POST /api/teams`) is open by default** so the first team can bootstrap itself. Set `DISABLE_TEAM_SIGNUP=true` after setup.
+- **Tool result, embedding, and rate-limit state are in-memory** — they reset on restart and are not shared across replicas.
+- **LLM prompts include attacker-influenceable text** (log lines, alert payloads). See the prompt-injection note in [SECURITY.md](SECURITY.md).
+
+---
+
+## Operations
+
+### Migrations
+```bash
+npm run db:migrate    # apply versioned migrations (safe to run on startup)
+npm run db:generate   # generate a new migration after schema changes
 ```
 
-## Conclusion
-The fundamental value of this platform is the **Orchestrator State Machine**. The UI, the API polling, the recovery buttons, and the step visualization are fully real. You only need to plug in your live environment credentials and transition the mocked closure in `executeStep` to the corresponding async network calls.
+The Docker `CMD` runs `node scripts/migrate.mjs`, which applies the versioned SQL files in `drizzle/` via drizzle-orm's migrator. It is idempotent — already-applied migrations are skipped.
+
+### Health checks
+```
+GET /api/health            → {"status":"ok"}            liveness probe
+GET /api/health/detailed   → {"status":"ok","checks":…}  readiness probe (DB + MCP + LLM + OTel)
+```
+
+### Metrics
+```
+GET /api/metrics   → 30-day summary, step p95, 8-week weekly trend (cached 60s)
+```
+
+### CLI (for scripted runbooks or CI incident drills)
+```bash
+AGENTCORE_URL=https://your-deployment AGENTCORE_TOKEN=eyJ... \
+  node scripts/run.mjs "payments-service p99 at 4s" --context "started after deploy v2.3"
+```

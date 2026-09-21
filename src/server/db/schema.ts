@@ -1,4 +1,5 @@
-import { pgTable, uuid, text, integer, real, boolean, timestamp, jsonb, pgEnum, vector, index } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, integer, real, boolean, timestamp, jsonb, pgEnum, vector, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 export const taskStatusEnum = pgEnum("task_status", ["pending", "running", "failed", "completed"]);
 export const stepStatusEnum = pgEnum("step_status", ["pending", "running", "success", "failed"]);
@@ -36,10 +37,15 @@ export const tasks = pgTable("tasks", {
   final_output:   text("final_output"),
   error:          text("error"),
   trace_id:       text("trace_id").notNull(),
-  inject_failure: boolean("inject_failure").notNull().default(false),
-  created_at:     timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updated_at:     timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+  inject_failure:      boolean("inject_failure").notNull().default(false),
+  dry_run:             boolean("dry_run").notNull().default(false),
+  correlated_task_id:  uuid("correlated_task_id"),
+  created_at:          timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updated_at:          timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  index("idx_tasks_team_id").on(t.team_id),
+  index("idx_tasks_created_at_status").on(t.created_at, t.status),
+]);
 
 export const checkpoints = pgTable("checkpoints", {
   id:          uuid("id").primaryKey().defaultRandom(),
@@ -52,7 +58,12 @@ export const checkpoints = pgTable("checkpoints", {
   output_data: jsonb("output_data"),
   error_info:  text("error_info"),
   created_at:  timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (t) => [
+  // FK column not auto-indexed in Postgres — this is the hottest lookup in the system
+  index("idx_checkpoints_task_id_status").on(t.task_id, t.step_status),
+  // Partial index for metrics queries (only success rows matter for p95 breakdown)
+  index("idx_checkpoints_success").on(t.step_name, t.duration_ms).where(sql`step_status = 'success'`),
+]);
 
 export const memories = pgTable("memories", {
   memory_id:  uuid("memory_id").primaryKey().defaultRandom(),
@@ -65,4 +76,5 @@ export const memories = pgTable("memories", {
   created_at: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   index("memories_embedding_idx").using("hnsw", t.embedding.op("vector_cosine_ops")),
+  index("idx_memories_team_id_created_at").on(t.team_id, t.created_at),
 ]);

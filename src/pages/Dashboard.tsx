@@ -22,7 +22,16 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadTasks();
-    const interval = setInterval(loadTasks, 5000);
+    // Smart polling: stop once all visible tasks are in a terminal state.
+    // Avoids indefinite 5s polls when the dashboard is in steady-state (D-1).
+    const interval = setInterval(async () => {
+      try {
+        const data = await fetchTasks();
+        setTasks(data);
+        const anyActive = data.some((t: { status: string }) => t.status === "pending" || t.status === "running");
+        if (!anyActive) clearInterval(interval);
+      } catch (e) { console.error(e); }
+    }, 5000);
     return () => clearInterval(interval);
   }, []);
 

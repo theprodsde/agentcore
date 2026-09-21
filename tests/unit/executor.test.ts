@@ -80,9 +80,9 @@ describe("deriveSynthesisFromOutput", () => {
     expect(out.ticket_id).toBe("INC-7777");
   });
 
-  it("generates a fallback INC- ticket when no ticket tool ran", () => {
+  it("leaves ticket_id empty when no ticket tool ran (no fabricated references)", () => {
     const out = deriveSynthesisFromOutput({}, "some goal");
-    expect(out.ticket_id).toMatch(/^INC-\d{4}$/);
+    expect(out.ticket_id).toBe("");
   });
 
   it("combines all three tool results correctly", () => {
@@ -101,10 +101,27 @@ describe("deriveSynthesisFromOutput", () => {
     expect(out.next_actions.length).toBeGreaterThan(0);
   });
 
-  it("falls back gracefully when execution output is empty", () => {
+  it("reports 'no clear anomaly' when execution output is empty, instead of inventing a cause", () => {
     const out = deriveSynthesisFromOutput({}, "DB deadlock on inventory-service");
     expect(out.summary).toContain("DB deadlock on inventory-service");
-    expect(out.next_actions).toContain("Review logs for root cause");
+    expect(out.summary).toContain("No clear anomaly");
+    expect(out.probable_cause).toContain("further investigation");
+    expect(out.next_actions.length).toBeGreaterThan(0);
+  });
+
+  it("treats routine warn/info logs with no breach as no-signal", () => {
+    const routineLogs = {
+      backend: "simulation",
+      service: "auth-service",
+      total_matched: 2,
+      entries: [
+        { timestamp: "2026-01-01T00:00:00Z", severity: "info", service: "auth-service", message: "GET /healthz 200 in 2ms", trace_id: "tr-1" },
+        { timestamp: "2026-01-01T00:00:01Z", severity: "warn", service: "auth-service", message: "metrics flush retried — succeeded", trace_id: "tr-2" },
+      ],
+    };
+    const out = deriveSynthesisFromOutput({ tool_search_logs: wrapAsContent(routineLogs) }, "OOM on auth-service");
+    expect(out.summary).toContain("No clear anomaly");
+    expect(out.affected_systems).toContain("auth-service");
   });
 
   it("falls back gracefully when tool result contains invalid JSON", () => {
@@ -113,7 +130,8 @@ describe("deriveSynthesisFromOutput", () => {
       "some goal"
     );
     expect(out).toBeDefined();
-    expect(out.ticket_id).toMatch(/^INC-\d{4}$/);
+    expect(out.ticket_id).toBe("");
+    expect(out.probable_cause).toContain("further investigation");
   });
 
   it("does not include the fallback runbook action more than once", () => {

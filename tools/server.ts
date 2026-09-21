@@ -2,7 +2,7 @@
  * AgentCore MCP Tool Server
  *
  * Runs as a subprocess communicating over stdio.
- * Exposes four tools: search_logs, get_metrics, create_ticket, list_services.
+ * Exposes five tools: search_logs, get_metrics, search_runbook, create_ticket, list_services.
  *
  * Each tool checks for a real backend env var first; falls back to a
  * deterministic simulation so the stack works without any external infra.
@@ -18,7 +18,39 @@ import "dotenv/config";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { z } from "zod";
+import { z, ZodError } from "zod";
+import { simulateLogs, simulateMetrics, simulateServices, parseRange } from "./simulation.js";
+
+// ─── Zod schemas for tool arg validation (G-2) ───────────────────────────────
+const SearchLogsSchema = z.object({
+  service:    z.string(),
+  query:      z.string(),
+  severity:   z.enum(["error", "warn", "info", "debug"]).optional(),
+  limit:      z.number().int().positive().max(100).default(20),
+  time_range: z.string().optional().default("1h"),
+});
+
+const GetMetricsSchema = z.object({
+  service:    z.string(),
+  metric:     z.string(),
+  time_range: z.string().optional().default("1h"),
+});
+
+const CreateTicketSchema = z.object({
+  title:            z.string(),
+  description:      z.string(),
+  severity:         z.enum(["critical", "high", "medium", "low"]),
+  affected_service: z.string().optional(),
+});
+
+const ListServicesSchema = z.object({
+  filter_status: z.enum(["all", "degraded", "down"]).optional().default("all"),
+});
+
+const SearchRunbookSchema = z.object({
+  query:   z.string(),
+  service: z.string().optional(),
+});
 
 const server = new Server({ name: "agentcore-tools", version: "1.0.0" }, {
   capabilities: { tools: {} },
@@ -80,25 +112,46 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: "search_runbook",
+      description: "Search internal runbooks for procedures matching this incident type. Returns relevant runbook excerpts and recommended steps.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Incident description or error pattern to search for" },
+          service: { type: "string", description: "Service name to narrow runbook search" },
+        },
+        required: ["query"],
+      },
+    },
   ],
 }));
 
 // ─── Tool handlers ────────────────────────────────────────────────────────────
 
-// Tool registry — add new tools here without touching the dispatch loop
+// Tool registry — add new tools here without touching the dispatch loop.
+// Each entry parses + validates args with Zod before calling the handler (G-2).
 const TOOL_REGISTRY: Record<string, (args: unknown) => Promise<unknown>> = {
-  search_logs:   (args) => searchLogs(args as SearchLogsArgs),
-  get_metrics:   (args) => getMetrics(args as GetMetricsArgs),
-  create_ticket: (args) => createTicket(args as CreateTicketArgs),
-  list_services: (args) => listServices(args as ListServicesArgs),
+  search_logs:    (args) => searchLogs(SearchLogsSchema.parse(args)),
+  get_metrics:    (args) => getMetrics(GetMetricsSchema.parse(args)),
+  create_ticket:  (args) => createTicket(CreateTicketSchema.parse(args)),
+  list_services:  (args) => listServices(ListServicesSchema.parse(args)),
+  search_runbook: (args) => searchRunbook(SearchRunbookSchema.parse(args)),
 };
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
   const handler = TOOL_REGISTRY[name];
   if (!handler) throw new Error(`Unknown tool: ${name}`);
-  const result = await handler(args);
-  return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  try {
+    const result = await handler(args);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    if (err instanceof ZodError) {
+      throw new Error(`Invalid arguments for tool ${name}: ${err.issues.map(i => `${i.path.join(".")}: ${i.message}`).join(", ")}`);
+    }
+    throw err;
+  }
 });
 
 // ─── search_logs ─────────────────────────────────────────────────────────────
@@ -118,55 +171,17 @@ async function searchLogs(args: SearchLogsArgs) {
     return await queryLoki(service, query, severity, limit, time_range);
   }
 
-  // Simulation: produce realistic log lines keyed on query keywords
-  const now = Date.now();
-  const keywords = query.toLowerCase();
-  const isDeadlock = keywords.includes("deadlock") || keywords.includes("lock") || keywords.includes("timeout");
-  const isOom      = keywords.includes("memory") || keywords.includes("oom") || keywords.includes("heap");
-  const isLatency  = keywords.includes("latency") || keywords.includes("slow") || keywords.includes("response");
-
-  const templates = isDeadlock
-    ? [
-        `[ERROR] ${service}: ER_LOCK_WAIT_TIMEOUT — transaction ${rnd("tx")} waited >30s for row lock on table orders`,
-        `[ERROR] ${service}: deadlock detected between workers ${rnd("w")} and ${rnd("w")} on connection pool slot 14`,
-        `[WARN]  ${service}: lock wait threshold breached 5 times in last 60s — pool utilisation 94%`,
-        `[ERROR] ${service}: SQLSTATE[40P01]: deadlock detected, query aborted — rolling back transaction`,
-        `[INFO]  ${service}: auto-retry attempt 3/3 on transaction ${rnd("tx")} — still failing`,
-      ]
-    : isOom
-    ? [
-        `[ERROR] ${service}: FATAL: JavaScript heap out of memory — rss 3.1GB, heapUsed 2.9GB`,
-        `[WARN]  ${service}: GC overhead limit exceeded — 98% of CPU time spent in GC over 30s window`,
-        `[ERROR] ${service}: process killed by OOMKiller — cgroup memory limit 3GB exceeded`,
-        `[WARN]  ${service}: memory allocation failed for buffer size 512MB — retrying with reduced batch`,
-      ]
-    : isLatency
-    ? [
-        `[WARN]  ${service}: p99 latency 4230ms — SLO threshold 1000ms`,
-        `[WARN]  ${service}: downstream call to postgres-primary timed out after 3000ms`,
-        `[ERROR] ${service}: circuit breaker OPEN after 10 consecutive 504s to dependency inventory-service`,
-        `[INFO]  ${service}: slow query detected — SELECT on orders table took 2840ms (missing index?)`,
-      ]
-    : [
-        `[ERROR] ${service}: unexpected error in request handler — ${query}`,
-        `[WARN]  ${service}: retrying failed operation — attempt 2/3`,
-        `[ERROR] ${service}: dependency health check failed`,
-      ];
-
-  const entries = templates.slice(0, Math.min(limit, templates.length)).map((msg, i) => ({
-    timestamp: new Date(now - (i * 12000)).toISOString(),
-    severity: msg.startsWith("[ERROR]") ? "error" : msg.startsWith("[WARN]") ? "warn" : "info",
-    service,
-    message: msg.replace(/^\[.*?\]\s+\S+:\s+/, ""),
-    trace_id: rnd("tr"),
-  }));
-
+  // Simulation: log content is derived from the world model's state for this
+  // service (see tools/simulation.ts) — not from the query. Healthy or unknown
+  // services return routine noise only, so "found nothing" is a possible outcome.
+  const { total_matched, entries, note } = simulateLogs(service, query, limit);
   return {
     backend: "simulation",
     service,
     query,
     time_range,
-    total_matched: entries.length,
+    total_matched,
+    ...(note ? { note } : {}),
     entries,
   };
 }
@@ -208,33 +223,16 @@ async function getMetrics(args: GetMetricsArgs) {
     return await queryPrometheus(service, metric, time_range);
   }
 
-  const key = metric.toLowerCase();
-  const isCpu     = key.includes("cpu");
-  const isLatency = key.includes("latency") || key.includes("p99") || key.includes("p95");
-  const isError   = key.includes("error") || key.includes("rate");
-  const isMem     = key.includes("mem") || key.includes("heap");
-
-  const current = isCpu ? 87.4 : isLatency ? 4230 : isError ? 12.3 : isMem ? 89.1 : 42.0;
-  const unit    = isCpu ? "%" : isLatency ? "ms" : isError ? "req/s errors" : isMem ? "%" : "req/s";
-  const trend   = "rising";
-  const threshold = isCpu ? 80 : isLatency ? 1000 : isError ? 5 : isMem ? 85 : null;
-
-  const now = Date.now();
-  const datapoints = Array.from({ length: 8 }, (_, i) => ({
-    timestamp: new Date(now - (7 - i) * (parseRange(time_range) / 8) * 1000).toISOString(),
-    value: +(current * (0.6 + (i / 7) * 0.5)).toFixed(2),
-  }));
-
+  // Simulation: values come from the world model — a healthy service reports
+  // healthy numbers even if the caller expected a breach.
+  const { threshold, ...sim } = simulateMetrics(service, metric, parseRange(time_range));
   return {
     backend: "simulation",
     service,
     metric,
     time_range,
-    current,
-    unit,
-    trend,
-    ...(threshold !== null && { threshold, threshold_breached: current > threshold }),
-    datapoints,
+    ...sim,
+    ...(threshold !== null ? { threshold } : {}),
   };
 }
 
@@ -333,20 +331,7 @@ interface ListServicesArgs {
 
 async function listServices(args: ListServicesArgs) {
   const { filter_status = "all" } = args;
-
-  const services = [
-    { name: "payments-service",   status: "degraded", latency_p99_ms: 4230, error_rate: 12.3, replicas: "2/3", last_deploy: "2h ago" },
-    { name: "inventory-service",  status: "degraded", latency_p99_ms: 890,  error_rate: 3.1,  replicas: "3/3", last_deploy: "4h ago" },
-    { name: "auth-service",       status: "healthy",  latency_p99_ms: 120,  error_rate: 0.1,  replicas: "3/3", last_deploy: "1d ago" },
-    { name: "notification-service", status: "healthy", latency_p99_ms: 45,  error_rate: 0.0,  replicas: "2/2", last_deploy: "3d ago" },
-    { name: "postgres-primary",   status: "degraded", latency_p99_ms: 3100, error_rate: 8.7,  replicas: "1/1", last_deploy: "n/a" },
-    { name: "redis-cache",        status: "healthy",  latency_p99_ms: 2,    error_rate: 0.0,  replicas: "1/1", last_deploy: "n/a" },
-    { name: "api-gateway",        status: "healthy",  latency_p99_ms: 210,  error_rate: 0.4,  replicas: "3/3", last_deploy: "6h ago" },
-  ];
-
-  const filtered = filter_status === "all"
-    ? services
-    : services.filter((s) => s.status === filter_status);
+  const filtered = simulateServices(filter_status);
 
   return {
     backend: "simulation",
@@ -356,17 +341,92 @@ async function listServices(args: ListServicesArgs) {
   };
 }
 
-// ─── helpers ─────────────────────────────────────────────────────────────────
+// ─── search_runbook ───────────────────────────────────────────────────────────
 
-function rnd(prefix: string) {
-  return `${prefix}-${Math.random().toString(36).substring(2, 9)}`;
+interface SearchRunbookArgs {
+  query: string;
+  service?: string;
 }
 
-function parseRange(range: string): number {
-  const match = range.match(/^(\d+)(m|h|d)$/);
-  if (!match) return 3600;
-  const [, n, unit] = match;
-  return parseInt(n) * (unit === "m" ? 60 : unit === "h" ? 3600 : 86400);
+async function searchRunbook(args: SearchRunbookArgs) {
+  const { query, service } = args;
+
+  if (process.env.RUNBOOK_URL) {
+    try {
+      const resp = await fetch(`${process.env.RUNBOOK_URL}/search?q=${encodeURIComponent(query)}&service=${encodeURIComponent(service ?? "")}`);
+      if (resp.ok) {
+        const data = await resp.json() as { results: unknown[] };
+        return { backend: "runbook_api", query, results: data.results };
+      }
+    } catch { /* fall through to simulation */ }
+  }
+
+  // Simulation: return contextual runbook entries based on query keywords
+  const q = query.toLowerCase();
+  const isDeadlock  = q.includes("deadlock") || q.includes("lock");
+  const isOom       = q.includes("oom") || q.includes("memory") || q.includes("heap");
+  const isLatency   = q.includes("latency") || q.includes("slow") || q.includes("p99");
+  const isCpu       = q.includes("cpu") || q.includes("throttl");
+  const svc         = service ?? "your-service";
+
+  const runbooks: { title: string; url: string; steps: string[] }[] = [];
+
+  if (isDeadlock) runbooks.push({
+    title: `DB Deadlock Runbook — ${svc}`,
+    url: "#runbook/db-deadlock",
+    steps: [
+      "Check active transactions: `SELECT * FROM pg_locks JOIN pg_stat_activity USING (pid) WHERE NOT granted;`",
+      "Kill blocking queries: `SELECT pg_cancel_backend(<pid>);`",
+      "Increase `lock_timeout` to fail fast rather than wait indefinitely",
+      "Review slow query log for missing indexes causing full-table scans",
+    ],
+  });
+
+  if (isOom) runbooks.push({
+    title: `Memory Leak / OOM Runbook — ${svc}`,
+    url: "#runbook/oom-response",
+    steps: [
+      "Cordon the affected pod: `kubectl cordon <node>`",
+      "Capture heap dump before restart: `kubectl exec <pod> -- node --prof`",
+      "Drain and restart: `kubectl rollout restart deployment/${svc}`",
+      "Set memory limits if not already configured in the Deployment spec",
+      "Check for event-listener leaks using `process.listenerCount('data')`",
+    ],
+  });
+
+  if (isLatency) runbooks.push({
+    title: `High Latency Runbook — ${svc}`,
+    url: "#runbook/latency",
+    steps: [
+      "Check downstream dependencies with `GET /api/health/detailed`",
+      "Review circuit-breaker state — open breakers cause immediate fallback latency",
+      "Query slow-query log: `SELECT query, mean_exec_time FROM pg_stat_statements ORDER BY mean_exec_time DESC LIMIT 10;`",
+      "Scale horizontal replicas if CPU > 80%: `kubectl scale deployment/${svc} --replicas=N`",
+    ],
+  });
+
+  if (isCpu) runbooks.push({
+    title: `CPU Saturation Runbook — ${svc}`,
+    url: "#runbook/cpu-saturation",
+    steps: [
+      "Identify hot function: attach profiler `clinic flame -- node server.js`",
+      "Check for synchronous operations blocking the event loop",
+      "Review recent deploys for N+1 query patterns or tight loops",
+      "Horizontal scale immediately to restore SLO, then investigate root cause",
+    ],
+  });
+
+  if (runbooks.length === 0) runbooks.push({
+    title: `General Incident Response — ${svc}`,
+    url: "#runbook/general",
+    steps: [
+      "Check service health endpoint and compare against last known-good baseline",
+      "Review recent deploys (last 2h) for correlation",
+      "Escalate to service owner if issue persists > 15 minutes",
+    ],
+  });
+
+  return { backend: "simulation", query, service: svc, results: runbooks };
 }
 
 // ─── Start ────────────────────────────────────────────────────────────────────

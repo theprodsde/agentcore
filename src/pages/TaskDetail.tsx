@@ -1,6 +1,6 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useCallback, useMemo } from "react";
 import { useParams } from "react-router-dom";
-import { fetchTask, fetchCheckpoints, resumeTask } from "../lib/api";
+import { fetchTask, fetchCheckpoints, resumeTask, streamTask } from "../lib/api";
 import { Task, Checkpoint } from "../types";
 import {
   CheckCircle2, Circle, AlertCircle, RefreshCw, Terminal,
@@ -21,7 +21,8 @@ export default function TaskDetail() {
   const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([]);
   const [resuming, setResuming]     = useState(false);
 
-  const loadData = async () => {
+  // useCallback so the effect and handleResume share a stable reference (D-3)
+  const loadData = useCallback(async () => {
     if (!taskId) return;
     try {
       const [tData, cData] = await Promise.all([fetchTask(taskId), fetchCheckpoints(taskId)]);
@@ -30,13 +31,27 @@ export default function TaskDetail() {
     } catch (e) {
       console.error(e);
     }
-  };
+  }, [taskId]);
 
   useEffect(() => {
-    loadData();
-    const interval = setInterval(loadData, 2000);
-    return () => clearInterval(interval);
-  }, [taskId]);
+    if (!taskId) return;
+    loadData(); // always load current state on mount
+
+    // Fetch-based SSE (sends the auth header, unlike EventSource) for live updates
+    const close = streamTask(
+      taskId,
+      (event) => {
+        // Any event means state changed — reload full task + checkpoints
+        loadData();
+        // Disconnect once terminal state reached
+        if (event.status === "completed" || event.status === "failed") close();
+      },
+      // Fallback to a delayed reload if the stream drops (e.g. proxy closes it)
+      () => setTimeout(loadData, 2000)
+    );
+
+    return close;
+  }, [taskId, loadData]);
 
   const handleResume = async () => {
     if (!taskId) return;
@@ -187,16 +202,12 @@ export default function TaskDetail() {
 // ─── Incident Report ──────────────────────────────────────────────────────────
 
 function IncidentReport({ raw }: { raw: string }) {
-  let data: SynthOutput = {};
-  let parseError = false;
+  // useMemo so JSON.parse only re-runs when raw changes, not on every SSE re-render (D-2)
+  const data = useMemo<SynthOutput | null>(() => {
+    try { return JSON.parse(raw) as SynthOutput; } catch { return null; }
+  }, [raw]);
 
-  try {
-    data = JSON.parse(raw) as SynthOutput;
-  } catch {
-    parseError = true;
-  }
-
-  if (parseError || !data.summary) {
+  if (!data?.summary) {
     return (
       <pre className="p-6 text-xs font-mono text-slate-600 whitespace-pre-wrap break-words overflow-auto">
         {raw}
@@ -252,7 +263,7 @@ function IncidentReport({ raw }: { raw: string }) {
             <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-2">Next Actions</p>
             <ol className="flex flex-col gap-2">
               {data.next_actions.map((action, i) => (
-                <li key={i} className="flex items-start gap-2.5">
+                <li key={action} className="flex items-start gap-2.5">
                   <span className="shrink-0 w-5 h-5 rounded-full bg-slate-100 text-slate-500 text-[10px] font-bold flex items-center justify-center mt-0.5">
                     {i + 1}
                   </span>
