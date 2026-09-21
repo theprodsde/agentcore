@@ -14,6 +14,8 @@ The closed alternatives (PagerDuty AIOps, incident.io, Datadog) are expensive an
 
 ## Try it in 90 seconds — no clone, no API keys
 
+![AgentCore demo](.github/assets/mcp-demo.gif)
+
 Every tool has a deterministic simulation fallback, so the full stack runs with zero credentials. Two commands, using the prebuilt image from GHCR:
 
 ```bash
