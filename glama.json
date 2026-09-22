@@ -1,0 +1,25 @@
+{
+  "$schema": "https://glama.ai/mcp/servers/schema/v1.json",
+  "name": "AgentCore",
+  "description": "Self-hosted AI incident triage with checkpointed resume and episodic memory. Runs a 4-step pipeline (recall → plan → MCP tools → synthesize) on alerts and posts the analysis to Slack in ~30 s. A crash mid-investigation resumes from the failed step only; resolved incidents write to pgvector so past fixes surface automatically. Works with Ollama.",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/theprodsde/agentcore",
+  "tools": [
+    {
+      "name": "investigate_incident",
+      "description": "Trigger a full AI investigation of an incident. Recalls similar past incidents from episodic memory, plans tool calls with an LLM, queries logs/metrics/runbooks, and synthesizes a report."
+    },
+    {
+      "name": "get_investigation",
+      "description": "Fetch an investigation's status, checkpoint timeline (per-step status and durations), and final report if completed."
+    },
+    {
+      "name": "search_incident_memory",
+      "description": "Semantic search over AgentCore's episodic memory of past incidents and their outcomes. Use to find how similar incidents were resolved before."
+    },
+    {
+      "name": "export_postmortem",
+      "description": "Export a completed investigation as a Markdown post-mortem (summary, probable cause, affected systems, next actions, checkpoint timeline)."
+    }
+  ]
+}
