@@ -530,9 +530,14 @@ export async function recoverStaleTasks() {
   logger.info({ count: stale.length }, "Recovering stale tasks from previous run");
 
   // Single bulk UPDATE instead of N sequential writes — O(1) round-trip vs O(N)
+  // The status filter guards against a TOCTOU race: a task that completed between
+  // the SELECT above and this UPDATE must not be reset to pending and re-run.
   await db.update(tasks)
     .set({ status: "pending", error: null, updated_at: new Date() })
-    .where(inArray(tasks.task_id, stale.map(t => t.task_id)));
+    .where(and(
+      inArray(tasks.task_id, stale.map(t => t.task_id)),
+      inArray(tasks.status, ["running", "pending"])
+    ));
 
   stale.forEach(t => setImmediate(() => runTaskOrchestrator(t.task_id)));
 }

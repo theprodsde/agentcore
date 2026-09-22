@@ -52,9 +52,13 @@ function requireAlertmanagerSecret(req: Request, res: Response, next: NextFuncti
   const secret = process.env.ALERTMANAGER_SECRET;
   if (!secret) return next();
   const provided = req.headers["x-alertmanager-secret"] as string | undefined;
-  const matches = !!provided
-    && provided.length === secret.length
-    && crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(secret));
+  if (!provided) return res.status(401).json({ error: "Invalid Alertmanager secret" });
+  const providedBuf = Buffer.from(provided);
+  const secretBuf = Buffer.from(secret);
+  let matches = false;
+  if (providedBuf.byteLength === secretBuf.byteLength) {
+    try { matches = crypto.timingSafeEqual(providedBuf, secretBuf); } catch { matches = false; }
+  }
   if (!matches) return res.status(401).json({ error: "Invalid Alertmanager secret" });
   next();
 }

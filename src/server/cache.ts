@@ -122,8 +122,18 @@ export function setCached(key: string, value: unknown, ttlMs = DEFAULT_TTL_MS): 
   store.set(key, value, ttlMs);
 }
 
+function sortKeysDeep(val: unknown): unknown {
+  if (Array.isArray(val)) return val.map(sortKeysDeep);
+  if (val !== null && typeof val === "object") {
+    return Object.fromEntries(
+      Object.keys(val as object).sort().map(k => [k, sortKeysDeep((val as Record<string, unknown>)[k])])
+    );
+  }
+  return val;
+}
+
 export function toolCacheKey(tool: string, args: Record<string, unknown>): string {
-  return `${tool}:${JSON.stringify(args, Object.keys(args).sort())}`;
+  return `${tool}:${JSON.stringify(sortKeysDeep(args))}`;
 }
 
 export function pruneExpired(): void {

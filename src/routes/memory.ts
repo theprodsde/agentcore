@@ -43,7 +43,7 @@ memoryRouter.post("/memory/query", asyncHandler(async (req, res) => {
     const queryEmbedding = await embed(query);
 
     if (queryEmbedding) {
-      const teamFilter = req.teamId ? sql`AND ${memories.team_id} = ${req.teamId}` : sql``;
+      const teamFilter = sql`AND ${memories.team_id} IS NOT DISTINCT FROM ${req.teamId ?? null}`;
       const matches = await db.select({
         memory_id:  memories.memory_id,
         task_id:    memories.task_id,
@@ -61,11 +61,9 @@ memoryRouter.post("/memory/query", asyncHandler(async (req, res) => {
     }
 
     // Keyword fallback scans the 100 most recent memories (not an arbitrary 100)
-    const allRows = req.teamId
-      ? await db.select(memorySummaryColumns).from(memories).where(eq(memories.team_id, req.teamId))
-          .orderBy(desc(memories.created_at)).limit(100)
-      : await db.select(memorySummaryColumns).from(memories)
-          .orderBy(desc(memories.created_at)).limit(100);
+    const allRows = await db.select(memorySummaryColumns).from(memories)
+      .where(sql`${memories.team_id} IS NOT DISTINCT FROM ${req.teamId ?? null}`)
+      .orderBy(desc(memories.created_at)).limit(100);
 
     const words = query.toLowerCase().split(/\W+/).filter((w: string) => w.length > 2);
     // Pre-build a Set per row so membership is O(1) per word — was O(T) per word with includes()

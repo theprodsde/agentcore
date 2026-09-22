@@ -36,7 +36,7 @@ async function dedupAndCreateTask(
   teamId: string | null
 ): Promise<CreateResult> {
   return db.transaction(async (tx) => {
-    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${dedupLockKey(input.goal, teamId)}))`);
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${teamId ?? 'public'}), hashtext(${dedupLockKey(input.goal, teamId)}))`);
 
     if (!input.inject_failure && !input.dry_run) {
       const windowStart = new Date(Date.now() - DEDUP_WINDOW_MS);
@@ -181,6 +181,7 @@ tasksRouter.get("/tasks/:task_id/stream", asyncHandler(async (req, res) => {
 
   // Auto-close if a task stays stuck and the client never disconnects
   const timeout = setTimeout(() => {
+    cleanup();
     res.write(`data: {"timeout":true}\n\n`);
     res.end();
   }, SSE_TIMEOUT_MS);
