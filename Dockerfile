@@ -7,8 +7,12 @@ RUN npm ci
 
 COPY . .
 
-# Build frontend + server bundles
+# Build frontend + server bundles.
+# agentcore-mcp.cjs is built without --packages=external so it is
+# fully self-contained and needs no node_modules at runtime.
 RUN npm run build
+
+# ── Main server image ────────────────────────────────────────────────────────
 
 FROM node:24-alpine AS runner
 
@@ -17,7 +21,6 @@ ENV NODE_ENV=production
 
 COPY --from=builder /app/package*.json ./
 COPY --from=builder /app/dist ./dist
-# Versioned migration files, applied at startup via drizzle-orm's migrator
 COPY --from=builder /app/drizzle ./drizzle
 COPY --from=builder /app/scripts/migrate.mjs ./scripts/migrate.mjs
 
@@ -28,6 +31,16 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s \
   CMD wget -qO- http://localhost:3000/api/health || exit 1
 
-# Run migrations (safe, idempotent) then start the server.
-# Uses drizzle-orm's bundled migrator — no drizzle-kit needed in the prod image.
 CMD ["sh", "-c", "node scripts/migrate.mjs && node dist/server.cjs"]
+
+# ── MCP server image (used by Glama and Claude Desktop / Claude Code) ────────
+# Self-contained: agentcore-mcp.cjs bundles all dependencies.
+# Requires AGENTCORE_URL pointing to a running AgentCore server.
+
+FROM node:24-alpine AS mcp
+
+WORKDIR /app
+
+COPY --from=builder /app/dist/tools/agentcore-mcp.cjs ./dist/tools/agentcore-mcp.cjs
+
+CMD ["node", "dist/tools/agentcore-mcp.cjs"]

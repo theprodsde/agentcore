@@ -8,7 +8,7 @@
   },
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs && esbuild tools/server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/tools/server.cjs && esbuild tools/agentcore-mcp.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/tools/agentcore-mcp.cjs",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs && esbuild tools/server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/tools/server.cjs && esbuild tools/agentcore-mcp.ts --bundle --platform=node --format=cjs --sourcemap --outfile=dist/tools/agentcore-mcp.cjs",
     "start": "node dist/server.cjs",
     "mcp": "tsx tools/agentcore-mcp.ts",
     "clean": "rm -rf dist",
