@@ -4,6 +4,23 @@
   "description": "Self-hosted AI incident triage with checkpointed resume and episodic memory. Runs a 4-step pipeline (recall → plan → MCP tools → synthesize) on alerts and posts the analysis to Slack in ~30 s. A crash mid-investigation resumes from the failed step only; resolved incidents write to pgvector so past fixes surface automatically. Works with Ollama.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/theprodsde/agentcore",
+  "attributes": [
+    "hosting:local-only"
+  ],
+  "environmentVariablesJsonSchema": {
+    "type": "object",
+    "required": ["AGENTCORE_URL"],
+    "properties": {
+      "AGENTCORE_URL": {
+        "type": "string",
+        "description": "The base URL of the running AgentCore server (e.g. http://localhost:3000)."
+      },
+      "AGENTCORE_TOKEN": {
+        "type": "string",
+        "description": "JWT token for authenticating with the AgentCore server. Required only when authentication is enabled (JWT_SECRET is set on the server)."
+      }
+    }
+  },
   "tools": [
     {
       "name": "investigate_incident",
